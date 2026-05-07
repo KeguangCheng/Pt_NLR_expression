@@ -1,0 +1,22 @@
+{
+    "read_files": "[ 01_qc_data/Pt8d-1_clean_1.fastq.gz, 01_qc_data/Pt8d-1_clean_2.fastq.gz]",
+    "expected_format": "IU",
+    "compatible_fragment_ratio": 1.0,
+    "num_compatible_fragments": 21804153,
+    "num_assigned_fragments": 21804153,
+    "num_frags_with_concordant_consistent_mappings": 28819135,
+    "num_frags_with_inconsistent_or_orphan_mappings": 1032186,
+    "strand_mapping_bias": 0.5048255612113272,
+    "MSF": 0,
+    "OSF": 0,
+    "ISF": 14548636,
+    "MSR": 0,
+    "OSR": 0,
+    "ISR": 14270499,
+    "SF": 520180,
+    "SR": 512006,
+    "MU": 0,
+    "OU": 0,
+    "IU": 0,
+    "U": 0
+}

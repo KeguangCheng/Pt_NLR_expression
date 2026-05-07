@@ -1,0 +1,142 @@
+Candidate TF-NLR regulatory network summary
+==========================================
+
+1. Parameters
+Tomtom q cutoff: 0.1 
+Top Tomtom hits per motif: 5 
+FIMO p cutoff: 1e-04 
+FIMO q cutoff: 0.1 
+Minimum absolute TF-NLR correlation: 0.7 
+Maximum correlation p-value: 0.05 
+Require TF DE: FALSE 
+Require same WGCNA module: FALSE 
+
+2. Input diagnostics
+Total TF genes: 2958 
+TF genes in datExpr: 1758 
+Tomtom kept matches: 139 
+FIMO NLR motif hits: 11496 
+Motif overlaps between Tomtom and FIMO: 10 
+Candidate pairs before expression filtering: 1140852 
+Candidate pairs after expression filtering: 618101 
+Candidate pairs after variance filtering: 618101 
+Candidate TF-NLR edges after correlation filtering: 55489 
+
+3. Tomtom motif-to-TF-family summary
+# A tibble: 38 × 3
+   Query_alt       Target_family n_matches
+   <chr>           <chr>             <int>
+ 1 AAAAAWAAWWWAAWA DOF                  25
+ 2 AAAAAWAAWWWAAWA C2H2                 11
+ 3 AAAAAWAAWWWAAWA B3                    4
+ 4 AAAAAWAAWWWAAWA ZFHD                  3
+ 5 AAAAAWAAWWWAAWA ARID                  2
+ 6 AAAAAWAAWWWAAWA G2-like               2
+ 7 AAAAAWAAWWWAAWA MADS                  2
+ 8 AAAAAWAAWWWAAWA MYB                   2
+ 9 AAAAAWAAWWWAAWA REM                   2
+10 AAAAAWAAWWWAAWA Trihelix              2
+# ℹ 28 more rows
+
+4. Motif enrichment summary
+# A tibble: 20 × 9
+   Motif           NLR_with_motif NLR_without_motif Background_with_motif
+   <chr>                    <int>             <int>                 <int>
+ 1 AAAAAWAAWWWAAWA            174                 7                 19855
+ 2 MEME-6                     174                 7                 19855
+ 3 TGGAYKCCRCNCSYW             81               100                 17497
+ 4 MEME-3                      81               100                 17497
+ 5 KGGSAWDTKKYGRAG             76               105                 18814
+ 6 MEME-4                      76               105                 18814
+ 7 AGTGYGGWCCCCAC              49               132                 12994
+ 8 MEME-8                      49               132                 12994
+ 9 GTGSACCCMACVCGC             46               135                 13101
+10 MEME-1                      46               135                 13101
+11 CCKCCRNMYWYCGHC             52               129                 15029
+12 MEME-5                      52               129                 15029
+13 RGGKTGSTGRATSCA             71               110                 22457
+14 MEME-2                      71               110                 22457
+15 SCCCTGKSACKYYYT             54               127                 16898
+16 MEME-9                      54               127                 16898
+17 SRGWSCTGYTTTGTT             46               135                 14528
+18 MEME-10                     46               135                 14528
+19 AARGTGGGGCCGAW              44               137                 15141
+20 MEME-7                      44               137                 15141
+# ℹ 5 more variables: Background_without_motif <int>, OddsRatio <dbl>,
+#   pvalue <dbl>, FDR <dbl>, Motif_enriched_in_NLR <lgl>
+
+5. Candidate edge summary by TF family
+# A tibble: 17 × 10
+   TF_family TF_count NLR_target_count Edge_count High_edges Medium_edges
+   <chr>        <int>            <int>      <int>      <int>        <int>
+ 1 C2H2            82              165      15444      11418         4026
+ 2 MYB            135              175      13063       5354         6541
+ 3 DOF             19              111       6767       4275         2411
+ 4 AP2/ERF        198               99       6700       1227         5473
+ 5 B3              26              133       3176       2760          416
+ 6 TCP             12               78       2461       1217         1149
+ 7 Trihelix        44              142       1498        862          571
+ 8 NAC             53              152       1322       1197          125
+ 9 G2-like         20              137       1263        960          284
+10 WRKY            38               46        969          0          777
+11 C3H             50              157        921        642          279
+12 bHLH            80               86        844        612          232
+13 MADS            14              111        437        254          183
+14 ARID            10               77        312        228           84
+15 bZIP            34               45        254         64          190
+16 CPP              3               30         30         28            2
+17 BPC              3               27         28          0           23
+# ℹ 4 more variables: Low_edges <int>, Mean_abs_cor <dbl>,
+#   SameModule_edges <int>, TF_DE_edges <int>
+
+6. Candidate edge summary by motif
+# A tibble: 10 × 8
+   Motif       TF_family_count TF_count NLR_target_count Edge_count Mean_abs_cor
+   <chr>                 <int>    <int>            <int>      <int>        <dbl>
+ 1 AAAAAWAAWW…              11      453              174      36521        0.778
+ 2 CCKCCRNMYW…               3      337               52       4897        0.780
+ 3 KGGSAWDTKK…               3      334               76       4208        0.779
+ 4 RGGKTGSTGR…               2      132               68       4189        0.781
+ 5 GTGSACCCMA…               2       76               39       1150        0.775
+ 6 AGTGYGGWCC…               1       10               29       1078        0.788
+ 7 AARGTGGGGC…               2      118               42       1013        0.784
+ 8 SCCCTGKSAC…               2       41               48        997        0.788
+ 9 TGGAYKCCRC…               2       89               70        796        0.779
+10 SRGWSCTGYT…               3       67               42        640        0.772
+# ℹ 2 more variables: Motif_OddsRatio <dbl>, Motif_enrichment_FDR <dbl>
+
+7. Top candidate TF hubs
+# A tibble: 30 × 11
+   TF_HubRank Gene      TF_name   TF_family Module    DE_LRT     padj OutDegree
+        <int> <chr>     <chr>     <chr>     <chr>     <lgl>     <dbl>     <int>
+ 1          1 PtQG40280 PtQG40280 DOF       turquoise TRUE   5.08e- 5      1476
+ 2          2 PtQG09600 PtQG09600 DOF       blue      FALSE  2.60e- 1      1070
+ 3          3 Pt9G20980 Pt9G20980 DOF       turquoise TRUE   8.84e- 3       954
+ 4          4 Pt5G37220 Pt5G37220 DOF       green     TRUE   2.59e- 2       886
+ 5          5 Pt5G24770 Pt5G24770 TCP       blue      TRUE   4.65e- 8       858
+ 6          6 Pt4G36450 Pt4G36450 C2H2      turquoise TRUE   8.72e- 4       704
+ 7          7 Pt9G22620 Pt9G22620 C2H2      blue      TRUE   3.00e-10       682
+ 8          8 Pt4G35940 Pt4G35940 C2H2      turquoise TRUE   4.53e-12       660
+ 9          9 PtJG03150 PtJG03150 C2H2      blue      TRUE   1.14e- 4       649
+10         10 PtQG43120 PtQG43120 C2H2      blue      TRUE   3.13e- 5       649
+# ℹ 20 more rows
+# ℹ 3 more variables: WeightedDegree <dbl>, MeanAbsCor <dbl>, MaxAbsCor <dbl>
+
+8. Top candidate NLR regulatory targets
+# A tibble: 30 × 8
+   NLR_TargetRank Gene      Type  Module DE_LRT     padj InDegree WeightedDegree
+            <int> <chr>     <chr> <chr>  <lgl>     <dbl>    <int>          <dbl>
+ 1              1 Pt6G47310 CNL   blue   TRUE   2.61e- 2     1342          1077.
+ 2              2 Pt6G22940 CNL   turqu… TRUE   6.36e- 3     1309          1059.
+ 3              3 Pt1G15880 TNL   blue   TRUE   5.07e- 7     1290          1038.
+ 4              4 Pt4G16580 RNL   turqu… TRUE   1.69e- 3     1150           926.
+ 5              5 Pt6G53830 TNL   turqu… TRUE   2.04e- 2      978           764.
+ 6              6 Pt1G01470 TNL   turqu… TRUE   1.72e- 4      890           725.
+ 7              7 Pt5G55930 CNL   blue   TRUE   4.23e-14      872           700.
+ 8              8 Pt4G26560 CNL   blue   TRUE   3.44e- 3      869           692.
+ 9              9 Pt7G02610 RNL   purple TRUE   1.21e- 4      868           690.
+10             10 Pt8G46050 CNL   blue   TRUE   1.07e-11      822           659.
+# ℹ 20 more rows
+
+9. Interpretation note
+This network should be interpreted as a candidate TF-NLR regulatory network. A TF-NLR edge is supported by promoter motif occurrence, Tomtom-inferred TF family similarity, TF-NLR expression correlation, and optional WGCNA module consistency. These edges do not prove direct binding or causal regulation and should be prioritized for future validation.

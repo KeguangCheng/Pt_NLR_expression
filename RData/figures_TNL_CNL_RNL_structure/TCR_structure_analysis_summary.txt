@@ -1,0 +1,57 @@
+TNL/CNL/RNL structural-class analysis summary
+================================================
+
+1. DE ratio by structural class
+# A tibble: 3 × 5
+  Type  Total_NLR Tested_NLR DE_NLR DE_ratio
+  <chr>     <dbl>      <dbl>  <dbl>    <dbl>
+1 TNL         531        468     95    0.203
+2 CNL         200        153     69    0.451
+3 RNL          59         40     17    0.425
+
+2. Overall Fisher exact test
+
+	Fisher's Exact Test for Count Data
+
+data:  type_de_mat
+p-value = 2.616e-09
+alternative hypothesis: two.sided
+
+
+3. Pairwise Fisher exact tests
+# A tibble: 3 × 10
+  comparison type1 type2 type1_DE type1_nonDE type2_DE type2_nonDE odds_ratio
+  <chr>      <chr> <chr>    <dbl>       <dbl>    <dbl>       <dbl>      <dbl>
+1 TNL_vs_CNL TNL   CNL         95         373       69          84      0.311
+2 TNL_vs_RNL TNL   RNL         95         373       17          23      0.345
+3 CNL_vs_RNL CNL   RNL         69          84       17          23      1.11 
+# ℹ 2 more variables: pvalue <dbl>, padj_BH <dbl>
+
+4. Standardized residuals
+# A tibble: 3 × 3
+  Type     DE nonDE
+  <chr> <dbl> <dbl>
+1 TNL   -6.36  6.36
+2 CNL    5.61 -5.61
+3 RNL    2.21 -2.21
+
+5. Highest and lowest DE ratio
+Highest DE ratio: CNL with 69 / 153 DE NLRs; ratio = 0.451 
+Lowest DE ratio: TNL with 95 / 468 DE NLRs; ratio = 0.203 
+
+6. Dominant Mfuzz cluster by structural class
+# A tibble: 3 × 5
+  Type  Cluster               NLR_count Type_total_in_clusters Within_type_ratio
+  <chr> <chr>                     <dbl>                  <dbl>             <dbl>
+1 CNL   C4_Late_up                   36                     69             0.522
+2 RNL   C1_Early_transient_up        12                     17             0.706
+3 TNL   C3_Early_peak_late_d…        41                     95             0.432
+
+7. Dominant WGCNA module by structural class
+# A tibble: 3 × 5
+  Type  Module    NLR_count Type_total_in_modules Within_type_ratio
+  <chr> <chr>         <dbl>                 <dbl>             <dbl>
+1 CNL   blue             24                    69             0.348
+2 RNL   turquoise         5                    17             0.294
+3 TNL   red              27                    95             0.284
+

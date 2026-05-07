@@ -1,0 +1,7 @@
+
+	Fisher's Exact Test for Count Data
+
+data:  type_de_mat
+p-value = 2.616e-09
+alternative hypothesis: two.sided
+

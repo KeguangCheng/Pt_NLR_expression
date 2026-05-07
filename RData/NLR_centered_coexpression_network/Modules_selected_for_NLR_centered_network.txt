@@ -1,0 +1,8 @@
+red
+darkgrey
+lightyellow
+green
+sienna2
+darkolivegreen2
+pink4
+coral

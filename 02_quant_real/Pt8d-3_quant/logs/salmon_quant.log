@@ -1,0 +1,43 @@
+[2026-04-06 11:19:43.026] [jointLog] [info] setting maxHashResizeThreads to 16
+[2026-04-06 11:19:43.026] [jointLog] [info] Fragment incompatibility prior below threshold.  Incompatible fragments will be ignored.
+[2026-04-06 11:19:43.026] [jointLog] [info] Usage of --validateMappings implies use of minScoreFraction. Since not explicitly specified, it is being set to 0.65
+[2026-04-06 11:19:43.026] [jointLog] [info] Setting consensusSlack to selective-alignment default of 0.35.
+[2026-04-06 11:19:43.026] [jointLog] [info] parsing read library format
+[2026-04-06 11:19:43.027] [jointLog] [info] There is 1 library.
+[2026-04-06 11:19:43.034] [jointLog] [info] Loading pufferfish index
+[2026-04-06 11:19:43.036] [jointLog] [info] Loading dense pufferfish index.
+[2026-04-06 11:19:43.508] [jointLog] [info] done
+[2026-04-06 11:19:43.565] [jointLog] [info] Index contained 86877 targets
+[2026-04-06 11:19:43.571] [jointLog] [info] Number of decoys : 0
+[2026-04-06 11:19:44.017] [jointLog] [info] Automatically detected most likely library type as IU
+
+[2026-04-06 11:21:22.034] [jointLog] [info] Computed 178567 rich equivalence classes for further processing
+[2026-04-06 11:21:22.034] [jointLog] [info] Counted 24589620 total reads in the equivalence classes 
+[2026-04-06 11:21:22.055] [jointLog] [info] Number of mappings discarded because of alignment score : 7869380
+[2026-04-06 11:21:22.055] [jointLog] [info] Number of fragments entirely discarded because of alignment score : 1841524
+[2026-04-06 11:21:22.055] [jointLog] [info] Number of fragments discarded because they are best-mapped to decoys : 0
+[2026-04-06 11:21:22.055] [jointLog] [info] Number of fragments discarded because they have only dovetail (discordant) mappings to valid targets : 94780
+[2026-04-06 11:21:22.055] [jointLog] [info] Mapping rate = 88.5893%
+
+[2026-04-06 11:21:22.055] [jointLog] [info] finished quantifyLibrary()
+[2026-04-06 11:21:22.069] [jointLog] [info] Starting optimizer
+[2026-04-06 11:21:22.096] [jointLog] [info] Marked 0 weighted equivalence classes as degenerate
+[2026-04-06 11:21:22.101] [jointLog] [info] iteration = 0 | max rel diff. = 14351.2
+[2026-04-06 11:21:22.035] [fileLog] [info] 
+At end of round 0
+==================
+Observed 27756889 total fragments (27756889 in most recent round)
+
+[2026-04-06 11:21:22.586] [jointLog] [info] iteration = 100 | max rel diff. = 5.47485
+[2026-04-06 11:21:23.070] [jointLog] [info] iteration = 200 | max rel diff. = 0.0986159
+[2026-04-06 11:21:23.554] [jointLog] [info] iteration = 300 | max rel diff. = 0.176579
+[2026-04-06 11:21:24.038] [jointLog] [info] iteration = 400 | max rel diff. = 0.0544416
+[2026-04-06 11:21:24.523] [jointLog] [info] iteration = 500 | max rel diff. = 0.451187
+[2026-04-06 11:21:24.619] [jointLog] [info] iteration = 521 | max rel diff. = 0.00595786
+[2026-04-06 11:21:24.621] [jointLog] [info] Finished optimizer
+[2026-04-06 11:21:24.621] [jointLog] [info] writing output 
+
+[2026-04-06 11:21:24.690] [jointLog] [warning] NOTE: Read Lib [[ 01_qc_data/Pt8d-3_clean_1.fastq.gz, 01_qc_data/Pt8d-3_clean_2.fastq.gz]] :
+
+Detected a *potential* strand bias > 1% in an unstranded protocol check the file: 02_quant_real/Pt8d-3_quant/lib_format_counts.json for details
+

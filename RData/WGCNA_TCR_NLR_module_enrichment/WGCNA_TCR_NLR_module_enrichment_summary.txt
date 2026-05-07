@@ -1,0 +1,73 @@
+WGCNA module re-ranking by TNL/CNL/RNL enrichment
+=================================================
+
+1. Background
+WGCNA background genes: 37898 
+All TNL/CNL/RNL genes in WGCNA: 672 
+LRT-DE TNL/CNL/RNL genes in WGCNA: 181 
+
+2. Top modules ranked by DE TNL/CNL/RNL enrichment
+# A tibble: 30 × 13
+   Rank_DE_TCR_enrichment Module          ModuleSize DE_TCR_NLR DE_TCR_density
+                    <int> <chr>                <int>      <int>          <dbl>
+ 1                      1 red                    794         27         0.0340
+ 2                      2 darkgrey               218          5         0.0229
+ 3                      3 lightyellow            253          5         0.0198
+ 4                      4 green                  851         10         0.0118
+ 5                      5 mistyrose3              32          1         0.0312
+ 6                      6 sienna2                 69          2         0.0290
+ 7                      7 blanchedalmond          38          1         0.0263
+ 8                      8 darkolivegreen2         78          2         0.0256
+ 9                      9 pink4                   83          2         0.0241
+10                     10 coral                   86          2         0.0233
+# ℹ 20 more rows
+# ℹ 8 more variables: Expected_DE_TCR_NLR <dbl>, FoldEnrichment_DE_TCR <dbl>,
+#   p_over_DE_TCR <dbl>, FDR_DE_TCR <dbl>, Priority <chr>, TNL_DE <int>,
+#   CNL_DE <int>, RNL_DE <int>
+
+3. Previously focused modules: blue / turquoise / red
+# A tibble: 3 × 12
+  Rank_DE_TCR_enrichment Module    ModuleSize DE_TCR_NLR DE_TCR_density
+                   <int> <chr>          <int>      <int>          <dbl>
+1                      1 red              794         27        0.0340 
+2                     32 blue            5857         37        0.00632
+3                     35 turquoise       5992         30        0.00501
+# ℹ 7 more variables: FoldEnrichment_DE_TCR <dbl>, p_over_DE_TCR <dbl>,
+#   FDR_DE_TCR <dbl>, Priority <chr>, TNL_DE <int>, CNL_DE <int>, RNL_DE <int>
+
+4. Type-specific enrichment, top records
+# A tibble: 50 × 8
+   Type  Module     ModuleSize ModuleTypeDE ExpectedTypeDE FoldEnrichment_TypeDE
+   <chr> <chr>           <int>        <int>          <dbl>                 <dbl>
+ 1 CNL   blue             5857           24         10.7                    2.25
+ 2 CNL   darkgrey          218            4          0.397                 10.1 
+ 3 CNL   lightyell…        253            3          0.461                  6.51
+ 4 CNL   tan3               61            1          0.111                  9.00
+ 5 CNL   sienna2            69            1          0.126                  7.96
+ 6 CNL   magenta4           87            1          0.158                  6.31
+ 7 CNL   yellow4           105            1          0.191                  5.23
+ 8 CNL   antiquewh…        110            1          0.200                  4.99
+ 9 CNL   salmon4           120            1          0.218                  4.58
+10 CNL   lightcyan1        139            1          0.253                  3.95
+# ℹ 40 more rows
+# ℹ 2 more variables: p_over_TypeDE <dbl>, FDR_TypeDE <dbl>
+
+5. High-priority modules
+# A tibble: 1 × 10
+  Rank_DE_TCR_enrichment Module ModuleSize DE_TCR_NLR DE_TCR_density
+                   <int> <chr>       <int>      <int>          <dbl>
+1                      1 red           794         27         0.0340
+# ℹ 5 more variables: FoldEnrichment_DE_TCR <dbl>, FDR_DE_TCR <dbl>,
+#   TNL_DE <int>, CNL_DE <int>, RNL_DE <int>
+
+6. Best module by enrichment ranking
+# A tibble: 1 × 13
+  Rank_DE_TCR_enrichment Module ModuleSize DE_TCR_NLR DE_TCR_density
+                   <int> <chr>       <int>      <int>          <dbl>
+1                      1 red           794         27         0.0340
+# ℹ 8 more variables: Expected_DE_TCR_NLR <dbl>, FoldEnrichment_DE_TCR <dbl>,
+#   p_over_DE_TCR <dbl>, FDR_DE_TCR <dbl>, Priority <chr>, TNL_DE <int>,
+#   CNL_DE <int>, RNL_DE <int>
+
+7. Suggested interpretation
+Modules should be prioritized by enrichment statistics, not raw NLR count alone. A large module can contain many NLRs simply because it contains many genes, whereas a smaller module with high DE TCR NLR density and high fold enrichment is more likely to represent an NLR-centered response module.

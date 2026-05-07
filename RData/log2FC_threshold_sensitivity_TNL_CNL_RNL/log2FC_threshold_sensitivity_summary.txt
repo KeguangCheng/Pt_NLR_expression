@@ -1,0 +1,110 @@
+log2FC threshold sensitivity analysis for TNL/CNL/RNL NLRs
+1. Time contrasts used for Wald test
+# A tibble: 3 × 3
+  time_level suffix contrast
+  <chr>      <chr>  <chr>   
+1 2d         2d     2d_vs_0d
+2 5d         5d     5d_vs_0d
+3 8d         8d     8d_vs_0d
+
+2. Overall threshold sensitivity
+# A tibble: 5 × 9
+  threshold threshold_label      Tested_NLR LRT_DE_NLR Retained_NLR Lost_NLR
+      <dbl> <fct>                     <int>      <int>        <int>    <int>
+1      0    LRT only                    661        181          181        0
+2      0.25 |max log2FC| >= 0.25        661        181          181        0
+3      0.5  |max log2FC| >= 0.5         661        181          181        0
+4      0.75 |max log2FC| >= 0.75        661        181          180        1
+5      1    |max log2FC| >= 1           661        181          179        2
+# ℹ 3 more variables: Retained_ratio_of_LRT_DE <dbl>,
+#   Lost_ratio_of_LRT_DE <dbl>, Retained_ratio_of_tested <dbl>
+
+3. Threshold sensitivity by structural type
+# A tibble: 15 × 10
+   threshold threshold_label   Type  Tested_NLR LRT_DE_NLR Retained_NLR Lost_NLR
+       <dbl> <fct>             <fct>      <int>      <int>        <int>    <int>
+ 1      0    LRT only          TNL          468         95           95        0
+ 2      0    LRT only          CNL          153         69           69        0
+ 3      0    LRT only          RNL           40         17           17        0
+ 4      0.25 |max log2FC| >= … TNL          468         95           95        0
+ 5      0.25 |max log2FC| >= … CNL          153         69           69        0
+ 6      0.25 |max log2FC| >= … RNL           40         17           17        0
+ 7      0.5  |max log2FC| >= … TNL          468         95           95        0
+ 8      0.5  |max log2FC| >= … CNL          153         69           69        0
+ 9      0.5  |max log2FC| >= … RNL           40         17           17        0
+10      0.75 |max log2FC| >= … TNL          468         95           95        0
+11      0.75 |max log2FC| >= … CNL          153         69           68        1
+12      0.75 |max log2FC| >= … RNL           40         17           17        0
+13      1    |max log2FC| >= 1 TNL          468         95           95        0
+14      1    |max log2FC| >= 1 CNL          153         69           68        1
+15      1    |max log2FC| >= 1 RNL           40         17           16        1
+# ℹ 3 more variables: Retained_ratio_of_LRT_DE <dbl>,
+#   Lost_ratio_of_LRT_DE <dbl>, Retained_ratio_of_tested <dbl>
+
+4. Strict |max log2FC| >= 1 loss summary
+# A tibble: 3 × 11
+  threshold threshold_label   Type  Tested_NLR LRT_DE_NLR Retained_NLR Lost_NLR
+      <dbl> <fct>             <fct>      <int>      <int>        <int>    <int>
+1         1 |max log2FC| >= 1 TNL          468         95           95        0
+2         1 |max log2FC| >= 1 CNL          153         69           68        1
+3         1 |max log2FC| >= 1 RNL           40         17           16        1
+# ℹ 4 more variables: Retained_ratio_of_LRT_DE <dbl>,
+#   Lost_ratio_of_LRT_DE <dbl>, Retained_ratio_of_tested <dbl>,
+#   Interpretation <chr>
+
+5. Response strength summary
+# A tibble: 15 × 5
+   Type  response_strength      NLR_count Type_total_DE Within_type_ratio
+   <fct> <fct>                      <int>         <int>             <dbl>
+ 1 TNL   strong_|LFC|>=1               95            95            1     
+ 2 TNL   moderate_0.5<=|LFC|<1          0            95            0     
+ 3 TNL   subtle_0.25<=|LFC|<0.5         0            95            0     
+ 4 TNL   LRT_only_|LFC|<0.25            0            95            0     
+ 5 TNL   LRT_DE_no_LFC                  0            95            0     
+ 6 CNL   strong_|LFC|>=1               68            69            0.986 
+ 7 CNL   moderate_0.5<=|LFC|<1          1            69            0.0145
+ 8 CNL   subtle_0.25<=|LFC|<0.5         0            69            0     
+ 9 CNL   LRT_only_|LFC|<0.25            0            69            0     
+10 CNL   LRT_DE_no_LFC                  0            69            0     
+11 RNL   strong_|LFC|>=1               16            17            0.941 
+12 RNL   moderate_0.5<=|LFC|<1          1            17            0.0588
+13 RNL   subtle_0.25<=|LFC|<0.5         0            17            0     
+14 RNL   LRT_only_|LFC|<0.25            0            17            0     
+15 RNL   LRT_DE_no_LFC                  0            17            0     
+
+6. Main response time and direction summary
+# A tibble: 15 × 7
+   Type  main_response_time direction_at_max response_time_direction NLR_count
+   <fct> <fct>              <fct>            <chr>                       <int>
+ 1 TNL   2d                 up_at_max        2d_up_at_max                   31
+ 2 TNL   2d                 down_at_max      2d_down_at_max                  1
+ 3 TNL   5d                 up_at_max        5d_up_at_max                    5
+ 4 TNL   5d                 down_at_max      5d_down_at_max                  7
+ 5 TNL   8d                 up_at_max        8d_up_at_max                   10
+ 6 TNL   8d                 down_at_max      8d_down_at_max                 41
+ 7 CNL   2d                 up_at_max        2d_up_at_max                    4
+ 8 CNL   5d                 up_at_max        5d_up_at_max                    1
+ 9 CNL   5d                 down_at_max      5d_down_at_max                  2
+10 CNL   8d                 up_at_max        8d_up_at_max                    1
+11 CNL   8d                 down_at_max      8d_down_at_max                 61
+12 RNL   2d                 up_at_max        2d_up_at_max                    1
+13 RNL   5d                 up_at_max        5d_up_at_max                    4
+14 RNL   8d                 up_at_max        8d_up_at_max                    7
+15 RNL   8d                 down_at_max      8d_down_at_max                  5
+# ℹ 2 more variables: Type_total_DE <int>, Within_type_ratio <dbl>
+
+7. Fisher test: structural type vs passing each FC threshold among LRT-DE NLRs
+# A tibble: 4 × 4
+  threshold threshold_label      pvalue padj_BH
+      <dbl> <chr>                 <dbl>   <dbl>
+1      1    |max log2FC| >= 1    0.0804   0.321
+2      0.75 |max log2FC| >= 0.75 0.475    0.950
+3      0.5  |max log2FC| >= 0.5  1        1    
+4      0.25 |max log2FC| >= 0.25 1        1    
+
+8. Key overall interpretation
+Under LRT-only criterion, the number of time-responsive TNL/CNL/RNL NLRs is 181.
+Under strict |max log2FC| >= 1 filtering, only 179 of 181 LRT-DE NLRs would be retained, while 2 would be discarded. Lost ratio = 0.011.
+
+Recommended reporting strategy:
+Use LRT adjusted p-value < 0.05 as the primary definition of time-responsive NLRs, and report |max log2FC| >= 1, 0.75, 0.5, and 0.25 as threshold sensitivity analyses.

@@ -1,0 +1,79 @@
+NLR-centered co-expression network analysis
+===========================================
+
+1. Parameters
+min_abs_cor: 0.8 
+max_pvalue: 0.05 
+top_n_targets_per_NLR: 50 
+soft_power_for_weight: 4 
+
+2. Selected modules
+# A tibble: 8 × 8
+  Rank_DE_TCR_enrichment Module          ModuleSize DE_TCR_NLR DE_TCR_density
+                   <dbl> <chr>                <dbl>      <dbl>          <dbl>
+1                      1 red                    794         27         0.0340
+2                      2 darkgrey               218          5         0.0229
+3                      3 lightyellow            253          5         0.0198
+4                      4 green                  851         10         0.0118
+5                      6 sienna2                 69          2         0.0290
+6                      8 darkolivegreen2         78          2         0.0256
+7                      9 pink4                   83          2         0.0241
+8                     10 coral                   86          2         0.0233
+# ℹ 3 more variables: FoldEnrichment_DE_TCR <dbl>, FDR_DE_TCR <dbl>,
+#   Priority <chr>
+
+3. Module network summary
+# A tibble: 8 × 18
+  Module  Edges Positive_edges Negative_edges Seed_NLRs Target_genes Total_nodes
+  <chr>   <int>          <int>          <int>     <int>        <int>       <int>
+1 red       161            119             42        23          122         135
+2 darkgr…   242            179             63         5          121         122
+3 lighty…   175             72            103         5           85          87
+4 green     381            155            226        10          281         288
+5 sienna2    21             16              5         2           16          18
+6 darkol…    13             11              2         2           11          13
+7 pink4      10              4              6         2           10          12
+8 coral      21              7             14         2           20          22
+# ℹ 11 more variables: NLR_targets <int>, Mean_abs_cor <dbl>,
+#   Median_abs_cor <dbl>, Max_abs_cor <dbl>, Rank_DE_TCR_enrichment <dbl>,
+#   ModuleSize <dbl>, DE_TCR_NLR <dbl>, DE_TCR_density <dbl>,
+#   FoldEnrichment_DE_TCR <dbl>, FDR_DE_TCR <dbl>, Priority <chr>
+
+4. Top NLR seed hubs
+# A tibble: 30 × 11
+   HubRank Gene      Type  Module      Degree WeightedDegree abs_kME Cluster    
+     <int> <chr>     <chr> <chr>        <int>          <dbl>   <dbl> <chr>      
+ 1       1 Pt1G00610 TNL   lightyellow     52           46.1   0.953 C2_Gradual…
+ 2       2 Pt5G51100 CNL   darkgrey        52           45.8   0.951 C2_Gradual…
+ 3       3 Pt5G54760 CNL   darkgrey        52           45.6   0.927 C2_Gradual…
+ 4       4 Pt6G12670 CNL   green           51           46.1   0.905 C2_Gradual…
+ 5       5 Pt5G51150 CNL   green           51           45.1   0.888 C2_Gradual…
+ 6       6 Pt1G76950 TNL   lightyellow     51           44.9   0.935 C4_Late_up 
+ 7       7 Pt5G50680 CNL   lightyellow     51           44.9   0.939 C2_Gradual…
+ 8       8 Pt5G57220 TNL   green           51           44.7   0.869 C4_Late_up 
+ 9       9 Pt6G49720 CNL   darkgrey        51           43.7   0.863 C4_Late_up 
+10      10 Pt6G12600 CNL   green           50           45.2   0.916 C2_Gradual…
+# ℹ 20 more rows
+# ℹ 3 more variables: max_abs_log2FC <dbl>, main_response_time <dbl>,
+#   direction_at_max <chr>
+
+5. Top non-NLR coexpressed hub targets
+# A tibble: 30 × 14
+   TargetHubRank Gene      Module      Degree InDegree WeightedDegree MeanAbsCor
+           <int> <chr>     <chr>        <int>    <int>          <dbl>      <dbl>
+ 1             1 Pt9G13770 darkgrey         5        5           4.37      0.875
+ 2             2 Pt2G59810 darkgrey         5        5           4.37      0.874
+ 3             3 Pt5G19910 darkgrey         5        5           4.37      0.873
+ 4             4 Pt8G50930 darkgrey         5        5           4.34      0.868
+ 5             5 Pt3G50900 darkgrey         5        5           4.32      0.863
+ 6             6 Pt1G15950 darkgrey         5        5           4.26      0.852
+ 7             7 PtQG19600 darkgrey         4        4           3.60      0.899
+ 8             8 Pt3G35280 lightyellow      4        4           3.58      0.895
+ 9             9 Pt6G19750 lightyellow      4        4           3.57      0.891
+10            10 Pt8G37610 darkgrey         4        4           3.52      0.879
+# ℹ 20 more rows
+# ℹ 7 more variables: MaxAbsCor <dbl>, kME <dbl>, abs_kME <dbl>,
+#   Preferred_name <chr>, Description <chr>, KEGG_Pathway <chr>, GOs <chr>
+
+6. Interpretation note
+This network should be interpreted as an NLR-centered co-expression candidate network. Edges indicate strong temporal expression correlation within prioritized WGCNA modules, not direct physical interaction or causal regulation.

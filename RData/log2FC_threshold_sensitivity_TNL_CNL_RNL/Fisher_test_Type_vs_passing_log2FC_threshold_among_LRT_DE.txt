@@ -1,0 +1,7 @@
+# A tibble: 4 × 4
+  threshold threshold_label      pvalue padj_BH
+      <dbl> <chr>                 <dbl>   <dbl>
+1      1    |max log2FC| >= 1    0.0804   0.321
+2      0.75 |max log2FC| >= 0.75 0.475    0.950
+3      0.5  |max log2FC| >= 0.5  1        1    
+4      0.25 |max log2FC| >= 0.25 1        1    

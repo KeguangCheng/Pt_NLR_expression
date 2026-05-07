@@ -1,0 +1,45 @@
+[2026-04-06 10:55:14.869] [puff::index::jointLog] [info] Running fixFasta
+[2026-04-06 10:55:17.171] [puff::index::jointLog] [warning] Removed 573 transcripts that were sequence duplicates of indexed transcripts.
+[2026-04-06 10:55:17.172] [puff::index::jointLog] [warning] If you wish to retain duplicate transcripts, please use the `--keepDuplicates` flag
+[2026-04-06 10:55:17.182] [puff::index::jointLog] [info] Replaced 100 non-ATCG nucleotides
+[2026-04-06 10:55:17.182] [puff::index::jointLog] [info] Clipped poly-A tails from 140 transcripts
+[2026-04-06 10:55:17.430] [puff::index::jointLog] [info] Filter size not provided; estimating from number of distinct k-mers
+[2026-04-06 10:55:18.020] [puff::index::jointLog] [info] ntHll estimated 78073354 distinct k-mers, setting filter size to 2^31
+[2026-04-06 10:55:39.378] [puff::index::jointLog] [info] Starting the Pufferfish indexing by reading the GFA binary file.
+[2026-04-06 10:55:39.379] [puff::index::jointLog] [info] Setting the index/BinaryGfa directory 02_quant_real/pinus_index
+[2026-04-06 10:55:39.576] [puff::index::jointLog] [info] Done wrapping the rank vector with a rank9sel structure.
+[2026-04-06 10:55:39.588] [puff::index::jointLog] [info] contig count for validation: 1333592
+[2026-04-06 10:55:39.729] [puff::index::jointLog] [info] Total # of Contigs : 1333592
+[2026-04-06 10:55:39.729] [puff::index::jointLog] [info] Total # of numerical Contigs : 1333592
+[2026-04-06 10:55:39.747] [puff::index::jointLog] [info] Total # of contig vec entries: 3739175
+[2026-04-06 10:55:39.747] [puff::index::jointLog] [info] bits per offset entry 22
+[2026-04-06 10:55:39.790] [puff::index::jointLog] [info] Done constructing the contig vector. 1333593
+[2026-04-06 10:55:39.971] [puff::index::jointLog] [info] # segments = 1333592
+[2026-04-06 10:55:39.971] [puff::index::jointLog] [info] total length = 118691432
+[2026-04-06 10:55:39.994] [puff::index::jointLog] [info] Reading the reference files ...
+[2026-04-06 10:55:40.283] [puff::index::jointLog] [info] positional integer width = 27
+[2026-04-06 10:55:40.283] [puff::index::jointLog] [info] seqSize = 118691432
+[2026-04-06 10:55:40.283] [puff::index::jointLog] [info] rankSize = 118691432
+[2026-04-06 10:55:40.283] [puff::index::jointLog] [info] edgeVecSize = 0
+[2026-04-06 10:55:40.283] [puff::index::jointLog] [info] num keys = 78683672
+[2026-04-06 10:55:42.371] [puff::index::jointLog] [info] mphf size = 49.1479 MB
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk size = 7418215
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 0 = [0, 7418239)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 1 = [7418239, 14836454)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 2 = [14836454, 22254669)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 3 = [22254669, 29672884)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 4 = [29672884, 37091099)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 5 = [37091099, 44509334)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 6 = [44509334, 51927549)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 7 = [51927549, 59345790)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 8 = [59345790, 66764005)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 9 = [66764005, 74182220)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 10 = [74182220, 81600446)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 11 = [81600446, 89018661)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 12 = [89018661, 96436885)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 13 = [96436885, 103855104)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 14 = [103855104, 111273319)
+[2026-04-06 10:55:42.478] [puff::index::jointLog] [info] chunk 15 = [111273319, 118691402)
+[2026-04-06 10:55:43.271] [puff::index::jointLog] [info] finished populating pos vector
+[2026-04-06 10:55:43.271] [puff::index::jointLog] [info] writing index components
+[2026-04-06 10:55:43.546] [puff::index::jointLog] [info] finished writing dense pufferfish index
