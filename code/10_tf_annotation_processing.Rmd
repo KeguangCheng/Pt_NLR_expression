@@ -1,0 +1,305 @@
+---
+title: "TF Annotation Processing"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+load_rds_list("03_vst_expression")
+load_rds_list("05_wgcna_soft_threshold")
+```
+
+```{r}
+############################################################
+## Rebuild Pt_TF_annotation.tsv from iTAK output
+## Important: iTAK file has NO header
+############################################################
+
+library(tidyverse)
+
+itak_file <- "tf_classification.txt"
+
+clean_gene_id <- function(x) {
+  x <- as.character(x)
+  id <- stringr::str_extract(x, "Pt[0-9]+G[0-9]+")
+  ifelse(is.na(id), x, id)
+}
+
+normalize_tf_family <- function(x) {
+  x0 <- toupper(str_trim(as.character(x)))
+  
+  case_when(
+    str_detect(x0, "AP2|EREBP|ERF|DREB") ~ "AP2/ERF",
+    str_detect(x0, "WRKY") ~ "WRKY",
+    str_detect(x0, "NAC") ~ "NAC",
+    str_detect(x0, "BZIP|TGA|ABI5") ~ "bZIP",
+    str_detect(x0, "BHLH|MYC") ~ "bHLH",
+    str_detect(x0, "MYB") ~ "MYB",
+    str_detect(x0, "TCP") ~ "TCP",
+    str_detect(x0, "MADS|AGL|SEP|SOC|VRN") ~ "MADS",
+    str_detect(x0, "C2H2|ZAT") ~ "C2H2",
+    str_detect(x0, "HD-ZIP|HDZIP|HOMEOBOX|HB") ~ "HD-ZIP",
+    str_detect(x0, "C2C2DOF|DOF") ~ "DOF",
+    str_detect(x0, "C2C2GATA|GATA") ~ "GATA",
+    str_detect(x0, "GRAS") ~ "GRAS",
+    str_detect(x0, "B3|ABI3|VP1") ~ "B3",
+    str_detect(x0, "HSF") ~ "HSF",
+    str_detect(x0, "ARF") ~ "ARF",
+    str_detect(x0, "AUX|IAA") ~ "AUX/IAA",
+    str_detect(x0, "G2LIKE|G2-LIKE") ~ "G2-like",
+    str_detect(x0, "BES1") ~ "BES1",
+    str_detect(x0, "BBR|BPC") ~ "BPC",
+    str_detect(x0, "E2F|DP") ~ "E2F/DP",
+    str_detect(x0, "CAMTA") ~ "CAMTA",
+    str_detect(x0, "GRF") ~ "GRF",
+    TRUE ~ as.character(x)
+  )
+}
+
+tf_raw <- read_tsv(
+  itak_file,
+  col_names = FALSE,
+  comment = "#",
+  show_col_types = FALSE
+)
+
+if (ncol(tf_raw) < 2) {
+  tf_raw <- read_table(
+    itak_file,
+    col_names = FALSE,
+    comment = "#",
+    show_col_types = FALSE
+  )
+}
+
+colnames(tf_raw)[1:4] <- c("Gene", "TF_family_raw", "Category", "Detail")
+
+Pt_TF_annotation <- tf_raw %>%
+  transmute(
+    Gene = clean_gene_id(Gene),
+    TF_family_raw = as.character(TF_family_raw),
+    TF_family = normalize_tf_family(TF_family_raw),
+    TF_name = Gene,
+    Category = as.character(Category),
+    Detail = as.character(Detail)
+  ) %>%
+  filter(
+    !is.na(Gene), Gene != "",
+    !is.na(TF_family), TF_family != ""
+  ) %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  arrange(TF_family, Gene)
+
+write_tsv(Pt_TF_annotation, analysis_file("Pt_TF_annotation.tsv"))
+
+cat("Total TF genes:", nrow(Pt_TF_annotation), "\n")
+
+Pt_TF_annotation %>%
+  count(TF_family, name = "TF_count") %>%
+  arrange(desc(TF_count)) %>%
+  print(n = 50)
+```
+```{r}
+library(tidyverse)
+
+Pt_TF_annotation <- read_tsv(
+  analysis_file("Pt_TF_annotation.tsv"),
+  show_col_types = FALSE
+)
+
+blast <- read_tsv(
+  "Pt_TF_vs_Arabidopsis.blastp.tsv",
+  col_names = c(
+    "Gene", "Arabidopsis_hit",
+    "pident", "length", "mismatch", "gapopen",
+    "qstart", "qend", "sstart", "send",
+    "evalue", "bitscore"
+  ),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Gene = Gene %>%
+      as.character() %>%
+      str_trim() %>%
+      str_replace("\\s.*$", "") %>%
+      str_replace("\\.\\d+$", ""),
+    
+    Arabidopsis_homolog = str_extract(Arabidopsis_hit, "AT[1-5CM]G[0-9]+")
+  ) %>%
+  arrange(Gene, evalue, desc(bitscore), desc(pident)) %>%
+  group_by(Gene) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(
+    Gene,
+    Arabidopsis_homolog,
+    Arabidopsis_hit,
+    Ath_pident = pident,
+    Ath_evalue = evalue,
+    Ath_bitscore = bitscore
+  )
+
+Pt_TF_annotation_with_Ath <- Pt_TF_annotation %>%
+  left_join(blast, by = "Gene")
+
+write_tsv(
+  Pt_TF_annotation_with_Ath,
+  analysis_file("Pt_TF_annotation.tsv")
+)
+
+Pt_TF_annotation_with_Ath %>%
+  summarise(
+    Total_TF = n(),
+    With_Arabidopsis_homolog = sum(!is.na(Arabidopsis_homolog))
+  )
+```
+```{r}
+tf_anno <- read_tsv(analysis_file("Pt_TF_annotation.tsv"), show_col_types = FALSE)
+
+sum(tf_anno$Gene %in% colnames(wgcna_data))
+sum(tf_anno$Gene %in% rownames(expr_matrix))
+head(tf_anno)
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(
+  Pt_TF_annotation_with_Ath %>%
+    dplyr::summarise(
+      Total_TF = dplyr::n(),
+      With_Arabidopsis_homolog = sum(!is.na(Arabidopsis_homolog))
+    ),
+  n = 20,
+  title = "TF annotation summary"
+)
+show_table(
+  Pt_TF_annotation_with_Ath %>%
+    dplyr::count(TF_family, name = "TF_count") %>%
+    dplyr::arrange(dplyr::desc(TF_count)),
+  n = 30,
+  title = "TF family counts"
+)
+show_table(Pt_TF_annotation_with_Ath, n = 20, title = "TF annotation preview")
+```

@@ -1,0 +1,298 @@
+---
+title: "Top Module Functional Enrichment"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+gene_module_df <- load_rds_object("06_gene_module_df")
+gene_module_df_clean <- as_tibble(gene_module_df) %>%
+  mutate(Gene = as.character(Gene), Module = as.character(Module))
+
+module_enrichment <- read_tsv(
+  analysis_file("WGCNA_TCR_NLR_module_enrichment", "WGCNA_module_TCR_NLR_enrichment.tsv"),
+  show_col_types = FALSE
+)
+
+load_rds_list("07_annotation_background")
+go_metadata <- load_rds_object("08_go_metadata")
+list2env(go_metadata, envir = .GlobalEnv)
+term2name <- load_rds_object("09_kegg_term2name")
+```
+
+```{r}
+############################################################
+## Step Y. KEGG enrichment for top NLR-enriched modules
+##  Modules selected by DE-TCR-NLR enrichment FDR
+##  (replaces the old blue/turquoise/red loop).
+############################################################
+
+outdir_kegg <- analysis_file("KEGG_top_modules_NEW")
+dir.create(outdir_kegg, showWarnings = FALSE, recursive = TRUE)
+
+modules_to_plot <- module_enrichment %>%
+  filter(DE_TCR_NLR >= 2) %>%
+  arrange(FDR_DE_TCR, desc(FoldEnrichment_DE_TCR), desc(DE_TCR_density)) %>%
+  head(8) %>%
+  pull(Module)
+
+cat("Modules to KEGG-enrich:", paste(modules_to_plot, collapse = ", "), "\n\n")
+
+for (mod in modules_to_plot) {
+  
+  target_genes <- gene_module_df_clean %>%
+    dplyr::filter(Module == mod) %>%
+    pull(Gene)
+  
+  if (length(target_genes) < 5) {
+    message("Skipped ", mod, " - too few genes")
+    next
+  }
+  
+  kegg_res <- enricher(
+    gene = target_genes,
+    TERM2GENE   = gene2kegg,
+    TERM2NAME   = term2name,
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if (is.null(kegg_res) || nrow(kegg_res) == 0) {
+    message("Module ", mod, ": no significant KEGG pathway")
+    next
+  }
+  
+  p_kegg <- dotplot(
+    kegg_res,
+    showCategory = 15,
+    title = paste("KEGG Enrichment -", mod, "Module")
+  )
+  
+  print(p_kegg)
+  
+  ggsave(file.path(outdir_kegg, paste0("KEGG_", mod, ".pdf")),
+         p_kegg, width = 9, height = 6)
+  ggsave(file.path(outdir_kegg, paste0("KEGG_", mod, ".png")),
+         p_kegg, width = 9, height = 6, dpi = 300)
+  
+  write_tsv(as.data.frame(kegg_res),
+            file.path(outdir_kegg, paste0("KEGG_", mod, "_table.tsv")))
+}
+```
+```{r}
+############################################################
+## Step Y-2. GO BP enrichment for top NLR-enriched modules
+##   compensates for KEGG misses (lightyellow, green, sienna2, etc.)
+############################################################
+
+
+outdir_go <- analysis_file("GO_BP_top_modules_NEW")
+dir.create(outdir_go, showWarnings = FALSE, recursive = TRUE)
+
+cat("Modules to GO-BP-enrich:", paste(modules_to_plot, collapse = ", "), "\n\n")
+
+go_bp_results <- list()
+
+for (mod in modules_to_plot) {
+  
+  target_genes <- gene_module_df_clean %>%
+    dplyr::filter(Module == mod) %>%
+    pull(Gene)
+  
+  if (length(target_genes) < 5) {
+    message("Skipped ", mod, " - too few genes")
+    next
+  }
+  
+go_res <- enricher(
+    gene         = target_genes,
+    universe     = gene_module_df_clean$Gene,
+    TERM2GENE    = gene2go,
+    TERM2NAME    = go2name,
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  if (is.null(go_res) || nrow(go_res) == 0) {
+    message("Module ", mod, ": no significant GO term")
+    next
+  }
+  
+  go_bp_results[[mod]] <- go_res
+  
+  p_go <- dotplot(
+    go_res,
+    showCategory = 15,
+    title = paste("GO enrichment -", mod, "Module")
+  )
+  
+  print(p_go)
+  
+  ggsave(file.path(outdir_go, paste0("GO_", mod, ".pdf")),
+         p_go, width = 9, height = 6.5)
+  ggsave(file.path(outdir_go, paste0("GO_", mod, ".png")),
+         p_go, width = 9, height = 6.5, dpi = 300)
+  write_tsv(as.data.frame(go_res),
+            file.path(outdir_go, paste0("GO_", mod, "_table.tsv")))
+}
+
+if (length(go_bp_results) > 0) {
+  go_summary <- purrr::imap_dfr(go_bp_results, function(res, mod) {
+    as.data.frame(res) %>%
+      dplyr::arrange(p.adjust) %>%
+      head(5) %>%
+      dplyr::mutate(Module = mod) %>%
+      dplyr::select(Module, ID, Description, GeneRatio, BgRatio,
+                    pvalue, p.adjust, Count)
+  })
+  
+  write_tsv(go_summary,
+            file.path(outdir_go, "GO_top5_per_module_summary.tsv"))
+  
+  cat("\n===== Top-5 GO BP terms per module =====\n")
+  print(go_summary)
+}
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(
+  tibble(Module = modules_to_plot),
+  n = 20,
+  title = "Modules included in top-module functional enrichment"
+)
+if (exists("go_summary")) {
+  show_table(go_summary, n = 30, title = "Top GO terms per module")
+}
+
+kegg_tables <- list.files(outdir_kegg, pattern = "_table[.]tsv$", full.names = TRUE)
+if (length(kegg_tables) > 0) {
+  kegg_preview <- purrr::map_dfr(kegg_tables, function(path) {
+    read_tsv(path, show_col_types = FALSE) %>%
+      dplyr::slice_head(n = 5) %>%
+      dplyr::mutate(Module = sub("^KEGG_(.*)_table[.]tsv$", "\\1", basename(path)), .before = 1)
+  })
+  show_table(kegg_preview, n = 30, title = "Top KEGG terms per module")
+}
+```

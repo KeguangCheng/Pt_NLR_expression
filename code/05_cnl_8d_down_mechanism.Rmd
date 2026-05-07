@@ -1,0 +1,466 @@
+---
+title: "CNL 8d Down Mechanism"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+load_rds_list("01_deseq_lrt")
+load_rds_list("03_vst_expression")
+load_rds_list("07_annotation_background")
+
+log2fc_file <- analysis_file("log2FC_threshold_sensitivity_TNL_CNL_RNL", "NLR_TCR_LRT_Wald_log2FC_sensitivity.tsv")
+if (file.exists(log2fc_file)) {
+  nlr_lfc <- read_tsv(log2fc_file, show_col_types = FALSE)
+} else {
+  load_rds_list("11_log2fc_threshold_sensitivity")
+}
+```
+
+```{r}
+############################################################
+## Step X. Mechanistic dissection of CNL 8d-down repression
+##  H1: tissue senescence (correlate with SAGs)
+##  H2: SA/JA-coupled feedback (correlate with SA/JA markers)
+##  H3: generic transcriptional decline (correlate with HK genes)
+############################################################
+
+
+outdir_cnl <- analysis_file("CNL_8d_down_mechanism")
+dir.create(outdir_cnl, showWarnings = FALSE, recursive = TRUE)
+
+
+## -----------------------------
+## 1. Identify CNL 8d-down genes
+## -----------------------------
+
+cnl_8d_down <- nlr_lfc %>%
+  filter(
+    Type == "CNL",
+    DE_LRT == TRUE,
+    as.character(main_response_time) %in% c("8d", "8", "8.0"),
+    direction_at_max == "down_at_max"
+  ) %>%
+  pull(Gene)
+
+cat("CNL 8d-down genes:", length(cnl_8d_down), "\n")
+
+
+## -----------------------------
+## 2. Build marker gene sets from eggNOG
+## -----------------------------
+
+# SA / JA pathway markers
+hormone_markers <- anno %>%
+  dplyr::filter(grepl("ko04075|ko00592", KEGG_Pathway)) %>%
+  pull(Gene) %>% unique()
+
+# Senescence-associated genes via leaf/organ senescence GO terms
+sag_markers <- anno %>%
+  dplyr::filter(grepl("GO:0010150|GO:0010260|GO:0090693", GOs)) %>%
+  pull(Gene) %>% unique()
+
+# Housekeeping control: ribosome (KEGG ko03010)
+hk_markers <- anno %>%
+  dplyr::filter(grepl("ko03010", KEGG_Pathway)) %>%
+  pull(Gene) %>% unique()
+
+cat(sprintf(
+  "Marker counts - SA/JA: %d, SAG: %d, HK control: %d\n",
+  length(hormone_markers), length(sag_markers), length(hk_markers)
+))
+
+
+## -----------------------------
+## 3. Per-CNL mean Spearman correlation with each marker set
+## -----------------------------
+
+cnl_in_expr <- intersect(cnl_8d_down, rownames(expr_matrix))
+
+compute_mean_cor <- function(cnl_genes, marker_genes, expr_mat) {
+  marker_in_expr <- intersect(marker_genes, rownames(expr_mat))
+  if (length(cnl_genes) == 0 || length(marker_in_expr) < 5) return(rep(NA_real_, length(cnl_genes)))
+  cor_mat <- cor(
+    t(expr_mat[cnl_genes, , drop = FALSE]),
+    t(expr_mat[marker_in_expr, , drop = FALSE]),
+    method = "spearman"
+  )
+  rowMeans(cor_mat, na.rm = TRUE)
+}
+
+cnl_cor_summary <- tibble(
+  Gene           = cnl_in_expr,
+  cor_with_SA_JA = compute_mean_cor(cnl_in_expr, hormone_markers, expr_matrix),
+  cor_with_SAG   = compute_mean_cor(cnl_in_expr, sag_markers,     expr_matrix),
+  cor_with_HK    = compute_mean_cor(cnl_in_expr, hk_markers,      expr_matrix)
+)
+
+write_tsv(cnl_cor_summary,
+          file.path(outdir_cnl, "CNL_8d_down_marker_correlations.tsv"))
+
+cat("\n===== Summary of marker-set correlations =====\n")
+print(summary(cnl_cor_summary[, -1]))
+
+
+## -----------------------------
+## 4. Boxplot + violin
+## -----------------------------
+
+cor_long <- cnl_cor_summary %>%
+  pivot_longer(-Gene, names_to = "MarkerSet", values_to = "MeanSpearman") %>%
+  mutate(MarkerSet = recode(MarkerSet,
+    cor_with_SA_JA = "SA/JA pathway",
+    cor_with_SAG   = "Senescence (SAG)",
+    cor_with_HK    = "Ribosome (HK)"
+  ))
+
+p_cor <- ggplot(cor_long, aes(x = MarkerSet, y = MeanSpearman, fill = MarkerSet)) +
+  geom_violin(alpha = 0.5, color = NA) +
+  geom_boxplot(width = 0.2, outlier.size = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = c(
+    "SA/JA pathway"    = "#D62728",
+    "Senescence (SAG)" = "#FF7F0E",
+    "Ribosome (HK)"    = "#7F7F7F"
+  )) +
+  labs(
+    title    = "CNL 8d-down genes: correlation with three marker sets",
+    subtitle = sprintf("n = %d CNL 8d-down genes", nrow(cnl_cor_summary)),
+    x = NULL, y = "Mean Spearman correlation per CNL gene"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_cor)
+ggsave(file.path(outdir_cnl, "CNL_8d_down_marker_correlation_boxplot.pdf"),
+       p_cor, width = 6.5, height = 5)
+ggsave(file.path(outdir_cnl, "CNL_8d_down_marker_correlation_boxplot.png"),
+       p_cor, width = 6.5, height = 5, dpi = 300)
+
+
+## -----------------------------
+## 5. Wilcoxon paired tests
+## -----------------------------
+
+cat("\n===== Wilcoxon paired tests (per-CNL correlations) =====\n")
+cat("SA/JA vs SAG:", with(cnl_cor_summary,
+  wilcox.test(cor_with_SA_JA, cor_with_SAG, paired = TRUE))$p.value, "\n")
+cat("SA/JA vs HK :", with(cnl_cor_summary,
+  wilcox.test(cor_with_SA_JA, cor_with_HK,  paired = TRUE))$p.value, "\n")
+cat("SAG   vs HK :", with(cnl_cor_summary,
+  wilcox.test(cor_with_SAG,   cor_with_HK,  paired = TRUE))$p.value, "\n")
+
+
+## -----------------------------
+## 6. Heatmap (CNL 8d-down + top markers, VST z-score)
+## -----------------------------
+
+top_marker_each <- function(marker_genes, n = 10) {
+  m <- intersect(marker_genes, rownames(expr_matrix))
+  if (length(m) < 2) return(character(0))
+  med_cor <- sapply(m, function(g) {
+    median(cor(expr_matrix[g, ],
+               t(expr_matrix[cnl_in_expr, , drop = FALSE]),
+               method = "spearman"), na.rm = TRUE)
+  })
+  names(sort(abs(med_cor), decreasing = TRUE))[1:min(n, length(m))]
+}
+
+top_SA_JA <- top_marker_each(hormone_markers, 10)
+top_SAG   <- top_marker_each(sag_markers, 10)
+
+heat_genes <- intersect(c(cnl_in_expr, top_SA_JA, top_SAG), rownames(expr_matrix))
+annotation_row <- data.frame(
+  GeneType = c(
+    rep("CNL 8d-down", sum(cnl_in_expr %in% heat_genes)),
+    rep("SA/JA marker", sum(top_SA_JA %in% heat_genes)),
+    rep("SAG marker",   sum(top_SAG   %in% heat_genes))
+  ),
+  row.names = heat_genes
+)
+
+pheatmap(
+  expr_matrix[heat_genes, ],
+  scale = "row", cluster_cols = FALSE, show_rownames = FALSE,
+  annotation_row = annotation_row,
+  main = "CNL 8d-down vs SA/JA & SAG markers (VST z-score)"
+)
+
+pheatmap(
+  expr_matrix[heat_genes, ],
+  scale = "row", cluster_cols = FALSE, show_rownames = FALSE,
+  annotation_row = annotation_row,
+  main = "CNL 8d-down vs SA/JA & SAG markers (VST z-score)",
+  filename = file.path(outdir_cnl, "CNL_8d_down_vs_markers_heatmap.pdf"),
+  width = 7, height = 9
+)
+```
+```{r}
+sa_core_kos <- c("K14508",  # NPR1/NPR3/NPR4 (SA receptor)
+                 "K13449",  # PR1 (SA marker)
+                 "K13435",  # TGA (SA TF)
+                 "K20712")  # ICS1/SID2 (SA biosynthesis)
+
+ja_core_kos <- c("K14509",  # JAR1 (JA-Ile conjugation)
+                 "K13464",  # COI1 (JA receptor)
+                 "K13463",  # JAZ (JA repressor)
+                 "K17760",  # MYC2 (JA TF)
+                 "K18021")  # LOX2/3/4 (JA biosynthesis)
+
+sa_markers_strict <- anno %>%
+  dplyr::filter(grepl(paste(sa_core_kos, collapse = "|"), KEGG_ko)) %>%
+  pull(Gene) %>% unique()
+
+ja_markers_strict <- anno %>%
+  dplyr::filter(grepl(paste(ja_core_kos, collapse = "|"), KEGG_ko)) %>%
+  pull(Gene) %>% unique()
+
+cat("Strict SA core markers:", length(sa_markers_strict), "\n")
+cat("Strict JA core markers:", length(ja_markers_strict), "\n")
+
+# SA: GO:0009751 response to salicylic acid
+# JA: GO:0009753 response to jasmonic acid
+if (length(sa_markers_strict) < 5) {
+  sa_markers_strict <- anno %>%
+    dplyr::filter(grepl("GO:0009751|GO:0009697", GOs)) %>%
+    pull(Gene) %>% unique()
+  cat("Fallback SA via GO:", length(sa_markers_strict), "\n")
+}
+if (length(ja_markers_strict) < 5) {
+  ja_markers_strict <- anno %>%
+    dplyr::filter(grepl("GO:0009753|GO:0009695", GOs)) %>%
+    pull(Gene) %>% unique()
+  cat("Fallback JA via GO:", length(ja_markers_strict), "\n")
+}
+
+cnl_in_expr <- intersect(cnl_8d_down, rownames(expr_matrix))
+compute_mean_cor <- function(target, marker_genes, mat) {
+  m <- intersect(marker_genes, rownames(mat))
+  if (length(m) < 3) return(NA_real_)
+  rowMeans(cor(t(mat[target, , drop = FALSE]),
+               t(mat[m,      , drop = FALSE]),
+               method = "spearman"), na.rm = TRUE)
+}
+cnl_strict <- tibble(
+  Gene = cnl_in_expr,
+  cor_SA = compute_mean_cor(cnl_in_expr, sa_markers_strict, expr_matrix),
+  cor_JA = compute_mean_cor(cnl_in_expr, ja_markers_strict, expr_matrix)
+)
+print(summary(cnl_strict[, -1]))
+
+cnl_strict %>% dplyr::filter(Gene == "Pt5G50680") %>% print()
+
+focus_pair <- c("Pt5G50680", "Pt6G26210")
+focus_cor <- tibble(
+  Gene = focus_pair,
+  cor_SA_strict = compute_mean_cor(focus_pair, sa_markers_strict, expr_matrix),
+  cor_JA_strict = compute_mean_cor(focus_pair, ja_markers_strict, expr_matrix)
+)
+print(focus_cor)
+```
+```{r}
+sa_vec <- colMeans(expr_matrix[intersect(sa_markers_strict, rownames(expr_matrix)), ])
+ja_vec <- colMeans(expr_matrix[intersect(ja_markers_strict, rownames(expr_matrix)), ])
+cnl_vec <- colMeans(expr_matrix[intersect(cnl_8d_down, rownames(expr_matrix)), ])
+
+z <- function(x) (x - mean(x)) / sd(x)
+
+cross_df <- tibble(
+  Sample = colnames(expr_matrix),
+  SA_zscore  = z(sa_vec),
+  JA_zscore  = z(ja_vec),
+  CNL_zscore = z(cnl_vec)
+) %>%
+  left_join(
+    as.data.frame(colData(dds)) %>% rownames_to_column("Sample") %>% dplyr::select(Sample, time),
+    by = "Sample"
+  ) %>%
+  pivot_longer(c(SA_zscore, JA_zscore, CNL_zscore),
+               names_to = "Track", values_to = "z") %>%
+  mutate(
+    Track = recode(Track,
+                   SA_zscore  = "SA pathway markers (n=22)",
+                   JA_zscore  = "JA pathway markers (n=77)",
+                   CNL_zscore = "CNL 8d-down (n=61)"),
+    time = factor(time, levels = c("0d","2d","5d","8d"))
+  ) %>%
+  group_by(Track, time) %>%
+  summarise(z_mean = mean(z), z_sd = sd(z), .groups = "drop")
+
+ggplot(cross_df, aes(x = time, y = z_mean, color = Track, group = Track)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = z_mean - z_sd, ymax = z_mean + z_sd),
+                width = 0.15, alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c(
+    "SA pathway markers (n=22)" = "#D62728",
+    "JA pathway markers (n=77)" = "#FF7F0E",
+    "CNL 8d-down (n=61)"        = "#1F77B4"
+  )) +
+  labs(title    = "Reciprocal expression: CNL surveillance pool vs hormone defense",
+       subtitle = "Strict SA/JA core markers; mean z-scored VST +/- SD",
+       x = "Time post-inoculation",
+       y = "Mean z-scored expression",
+       color = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+```{r save-strict-marker-trend}
+if (exists("cross_df")) {
+  dir.create(outdir_cnl, showWarnings = FALSE, recursive = TRUE)
+  p_strict_marker_trend <- last_plot()
+  ggsave(
+    file.path(outdir_cnl, "CNL_8d_down_strict_hormone_marker_trends.pdf"),
+    p_strict_marker_trend,
+    width = 7,
+    height = 5
+  )
+  ggsave(
+    file.path(outdir_cnl, "CNL_8d_down_strict_hormone_marker_trends.png"),
+    p_strict_marker_trend,
+    width = 7,
+    height = 5,
+    dpi = 300
+  )
+}
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(
+  tibble(
+    Metric = c("CNL_8d_down_genes", "SA_JA_markers", "SAG_markers", "HK_markers"),
+    Value = c(length(cnl_8d_down), length(hormone_markers), length(sag_markers), length(hk_markers))
+  ),
+  n = 20,
+  title = "CNL 8d-down mechanism summary"
+)
+show_table(cnl_cor_summary, n = 30, title = "Marker-set correlations for CNL 8d-down genes")
+if (exists("cnl_strict")) {
+  show_table(cnl_strict, n = 30, title = "Strict SA and JA marker correlations")
+}
+```

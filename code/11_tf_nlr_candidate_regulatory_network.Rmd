@@ -1,0 +1,1932 @@
+---
+title: "TF NLR Candidate Regulatory Network"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+load_rds_list("01_deseq_lrt")
+load_rds_list("03_vst_expression")
+load_rds_list("05_wgcna_soft_threshold")
+gene_module_df <- load_rds_object("06_gene_module_df")
+```
+
+```{r}
+############################################################
+## Step B. TF-NLR candidate regulatory network
+##
+## Evidence:
+##   1. MEME motif discovered from 181 DE NLR promoters
+##   2. Tomtom motif similarity to Arabidopsis DAP motifs
+##   3. FIMO motif occurrence in NLR promoters
+##   4. TF-NLR expression correlation
+##   5. WGCNA module consistency
+##
+## Main output:
+##   04_TF_NLR_network/
+##     Candidate_TF_NLR_edges.tsv
+##     Candidate_TF_NLR_nodes.tsv
+##     Cytoscape_TF_NLR_edges.tsv
+##     Cytoscape_TF_NLR_nodes.tsv
+##     Candidate_TF_hub_ranking.tsv
+##     Candidate_NLR_regulatory_target_ranking.tsv
+############################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(jsonlite)
+  library(WGCNA)
+  library(scales)
+})
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+############################################################
+## 0. Settings
+############################################################
+
+outdir <- analysis_file("04_TF_NLR_network")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+fig_outdir <- file.path(outdir, "figures")
+dir.create(fig_outdir, showWarnings = FALSE, recursive = TRUE)
+
+## Input files
+tomtom_html_file <- "meme1.5kb/Tomtom Results.html"
+tomtom_tsv_file <- "meme1.5kb/tomtom.tsv"
+
+fimo_nlr_file <- "nlr.1.5kb.fimo.tsv"
+fimo_all_file <- "1.5kb.fimo.tsv"
+
+tf_annotation_file <- analysis_file("Pt_TF_annotation.tsv")
+
+nlr_master_file <- analysis_file("NLR_master_TNL_CNL_RNL.tsv")
+
+## Filtering parameters
+tomtom_q_cutoff <- 0.10
+top_tomtom_hits_per_motif <- 5
+
+fimo_p_cutoff <- 1e-4
+fimo_q_cutoff <- 0.10
+
+min_abs_cor <- 0.70
+max_cor_pvalue <- 0.05
+
+require_TF_DE <- FALSE
+require_same_module <- FALSE
+
+tcr_levels <- c("TNL", "CNL", "RNL")
+
+############################################################
+## 1. Helper functions
+############################################################
+
+save_plot <- function(plot_obj, filename, width = 7, height = 5) {
+  ggsave(
+    filename = file.path(fig_outdir, paste0(filename, ".pdf")),
+    plot = plot_obj,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    filename = file.path(fig_outdir, paste0(filename, ".png")),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+clean_gene_id <- function(x) {
+  x <- as.character(x)
+  id <- stringr::str_extract(x, "Pt[0-9]+G[0-9]+")
+  ifelse(is.na(id), str_replace(str_trim(x), "\\.\\d+$", ""), id)
+}
+
+as_logical_safe <- function(x) {
+  if (is.logical(x)) return(x)
+  
+  x_chr <- toupper(trimws(as.character(x)))
+  
+  dplyr::case_when(
+    x_chr %in% c("TRUE", "T", "1", "YES", "Y") ~ TRUE,
+    x_chr %in% c("FALSE", "F", "0", "NO", "N") ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+to_num <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+normalize_tf_family <- function(x) {
+  x0 <- toupper(str_trim(as.character(x)))
+  
+  case_when(
+    str_detect(x0, "AP2|EREBP|ERF|DREB") ~ "AP2/ERF",
+    str_detect(x0, "WRKY") ~ "WRKY",
+    str_detect(x0, "NAC") ~ "NAC",
+    str_detect(x0, "BZIP|TGA|ABI5") ~ "bZIP",
+    str_detect(x0, "BHLH|MYC") ~ "bHLH",
+    str_detect(x0, "MYB") ~ "MYB",
+    str_detect(x0, "TCP") ~ "TCP",
+    str_detect(x0, "MADS|AGL|SEP|SOC|VRN") ~ "MADS",
+    str_detect(x0, "C2H2|ZAT") ~ "C2H2",
+    str_detect(x0, "HD-ZIP|HDZIP|HOMEOBOX|HB") ~ "HD-ZIP",
+    str_detect(x0, "C2C2DOF|DOF") ~ "DOF",
+    str_detect(x0, "C2C2GATA|GATA") ~ "GATA",
+    str_detect(x0, "GRAS") ~ "GRAS",
+    str_detect(x0, "B3|ABI3|VP1|ABI3VP1") ~ "B3",
+    str_detect(x0, "HSF") ~ "HSF",
+    str_detect(x0, "ARF") ~ "ARF",
+    str_detect(x0, "AUX|IAA") ~ "AUX/IAA",
+    str_detect(x0, "G2LIKE|G2-LIKE") ~ "G2-like",
+    str_detect(x0, "BES1") ~ "BES1",
+    str_detect(x0, "BBR|BPC") ~ "BPC",
+    str_detect(x0, "E2F|DP") ~ "E2F/DP",
+    str_detect(x0, "CAMTA") ~ "CAMTA",
+    str_detect(x0, "GRF") ~ "GRF",
+    TRUE ~ as.character(x)
+  )
+}
+
+make_motif_alias_long <- function(df, motif_cols, keep_cols = NULL) {
+  motif_cols <- intersect(motif_cols, colnames(df))
+  keep_cols <- intersect(keep_cols, colnames(df))
+  
+  if (length(motif_cols) == 0) {
+    stop("No motif columns found for alias generation.")
+  }
+  
+  df %>%
+    mutate(row_id_tmp = row_number()) %>%
+    dplyr::select(row_id_tmp, all_of(motif_cols), all_of(keep_cols)) %>%
+    pivot_longer(
+      cols = all_of(motif_cols),
+      names_to = "Motif_source",
+      values_to = "Motif"
+    ) %>%
+    mutate(
+      Motif = as.character(Motif),
+      Motif = ifelse(is.na(Motif) | Motif == "" | Motif == "NA", NA_character_, Motif)
+    ) %>%
+    filter(!is.na(Motif)) %>%
+    distinct()
+}
+
+empty_edge_table <- function() {
+  tibble(
+    Source = character(),
+    Target = character(),
+    EdgeType = character(),
+    Motif = character(),
+    TF_family = character(),
+    TF_name = character(),
+    NLR_Type = character(),
+    Correlation = numeric(),
+    abs_cor = numeric(),
+    cor_pvalue = numeric(),
+    cor_FDR = numeric(),
+    Direction = character(),
+    EdgeDirection = character(),
+    EvidenceScore = numeric(),
+    EvidenceClass = character()
+  )
+}
+
+############################################################
+## 2. Read and fix TF annotation
+############################################################
+
+if (!file.exists(tf_annotation_file)) {
+  stop("Cannot find TF annotation file: ", tf_annotation_file)
+}
+
+tf_raw_first <- read_tsv(
+  tf_annotation_file,
+  show_col_types = FALSE,
+  progress = FALSE
+)
+
+if (all(c("Gene", "TF_family") %in% colnames(tf_raw_first))) {
+  
+  tf_anno <- tf_raw_first %>%
+    mutate(
+      TF_gene = clean_gene_id(Gene),
+      TF_family_raw = if ("TF_family_raw" %in% colnames(.)) as.character(TF_family_raw) else as.character(TF_family),
+      TF_family = normalize_tf_family(TF_family),
+      TF_name = if ("TF_name" %in% colnames(.)) as.character(TF_name) else TF_gene
+    )
+  
+} else {
+  
+  message("TF annotation appears to have no standard header. Reading as iTAK-style no-header table.")
+  
+  tf_raw <- read_tsv(
+    tf_annotation_file,
+    col_names = FALSE,
+    comment = "#",
+    show_col_types = FALSE
+  )
+  
+  if (ncol(tf_raw) < 2) {
+    stop("TF annotation file has fewer than 2 columns.")
+  }
+  
+  while (ncol(tf_raw) < 4) {
+    tf_raw[[ncol(tf_raw) + 1]] <- NA_character_
+  }
+  
+  colnames(tf_raw)[1:4] <- c("Gene", "TF_family_raw", "Category", "Detail")
+  
+  tf_anno <- tf_raw %>%
+    transmute(
+      TF_gene = clean_gene_id(Gene),
+      TF_family_raw = as.character(TF_family_raw),
+      TF_family = normalize_tf_family(TF_family_raw),
+      TF_name = TF_gene,
+      Category = as.character(Category),
+      Detail = as.character(Detail)
+    )
+}
+
+tf_anno <- tf_anno %>%
+  mutate(
+    TF_gene = clean_gene_id(TF_gene),
+    TF_family_raw = as.character(TF_family_raw),
+    TF_family = normalize_tf_family(TF_family),
+    TF_name = ifelse(is.na(TF_name) | TF_name == "", TF_gene, as.character(TF_name))
+  ) %>%
+  filter(
+    !is.na(TF_gene), TF_gene != "",
+    !is.na(TF_family), TF_family != ""
+  ) %>%
+  distinct(TF_gene, .keep_all = TRUE)
+
+write_tsv(
+  tf_anno,
+  file.path(outdir, "TF_annotation_cleaned.tsv")
+)
+
+cat("\n===== TF annotation check =====\n")
+cat("Total TF genes:", nrow(tf_anno), "\n")
+print(
+  tf_anno %>%
+    count(TF_family, name = "TF_count") %>%
+    arrange(desc(TF_count)) %>%
+    print(n = 50)
+)
+
+############################################################
+## 3. Prepare expression matrix as samples x genes
+############################################################
+
+if (exists("wgcna_data")) {
+  datExpr_raw <- as.data.frame(wgcna_data)
+  message("Using wgcna_data as expression matrix.")
+} else if (exists("datExpr")) {
+  datExpr_raw <- as.data.frame(datExpr)
+  message("Using datExpr as expression matrix.")
+} else if (exists("expr_matrix")) {
+  datExpr_raw <- as.data.frame(expr_matrix)
+  message("Using expr_matrix as expression matrix.")
+} else {
+  stop("Cannot find expression object: wgcna_data, datExpr, or expr_matrix.")
+}
+
+tf_ids <- tf_anno$TF_gene
+
+overlap_col <- sum(colnames(datExpr_raw) %in% tf_ids)
+overlap_row <- sum(rownames(datExpr_raw) %in% tf_ids)
+
+cat("\n===== Expression matrix orientation check =====\n")
+cat("TF overlap with columns:", overlap_col, "\n")
+cat("TF overlap with rows:", overlap_row, "\n")
+
+if (overlap_row > overlap_col) {
+  datExpr <- as.data.frame(t(as.matrix(datExpr_raw)))
+  message("Expression matrix was transposed to samples x genes.")
+} else {
+  datExpr <- datExpr_raw
+  message("Expression matrix treated as samples x genes.")
+}
+
+datExpr <- as.data.frame(datExpr)
+datExpr[] <- lapply(datExpr, function(x) as.numeric(as.character(x)))
+
+gene_sd <- sapply(datExpr, function(x) sd(x, na.rm = TRUE))
+keep_cols <- !is.na(gene_sd) & gene_sd > 0
+datExpr <- datExpr[, keep_cols, drop = FALSE]
+
+cat("Final datExpr samples:", nrow(datExpr), "\n")
+cat("Final datExpr genes:", ncol(datExpr), "\n")
+cat("TF genes in datExpr:", sum(tf_anno$TF_gene %in% colnames(datExpr)), "\n")
+
+############################################################
+## 4. Parse Tomtom results
+############################################################
+
+extract_json_var_from_html <- function(html_file, varname = "data") {
+  
+  txt <- paste(readLines(html_file, warn = FALSE), collapse = "\n")
+  pattern <- paste0("var\\s+", varname, "\\s*=\\s*\\{")
+  m <- regexpr(pattern, txt, perl = TRUE)
+  
+  if (m[1] < 0) {
+    stop("Cannot find JavaScript variable '", varname, "' in ", html_file)
+  }
+  
+  start_match <- as.integer(m[1])
+  matched_txt <- regmatches(txt, m)
+  open_brace_pos <- start_match + nchar(matched_txt) - 1
+  
+  subtxt <- substring(txt, open_brace_pos)
+  chars <- strsplit(subtxt, "", fixed = TRUE)[[1]]
+  
+  depth <- 0
+  in_string <- FALSE
+  escape <- FALSE
+  end_idx <- NA_integer_
+  
+  for (i in seq_along(chars)) {
+    ch <- chars[i]
+    
+    if (in_string) {
+      if (escape) {
+        escape <- FALSE
+      } else if (ch == "\\") {
+        escape <- TRUE
+      } else if (ch == '"') {
+        in_string <- FALSE
+      }
+    } else {
+      if (ch == '"') {
+        in_string <- TRUE
+      } else if (ch == "{") {
+        depth <- depth + 1
+      } else if (ch == "}") {
+        depth <- depth - 1
+        if (depth == 0) {
+          end_idx <- i
+          break
+        }
+      }
+    }
+  }
+  
+  if (is.na(end_idx)) {
+    stop("Could not find the end of JSON object in Tomtom HTML.")
+  }
+  
+  json_txt <- paste0(chars[1:end_idx], collapse = "")
+  jsonlite::fromJSON(json_txt, simplifyVector = FALSE)
+}
+
+parse_tomtom_html <- function(html_file) {
+  
+  data <- extract_json_var_from_html(html_file, "data")
+  
+  queries <- purrr::map_dfr(seq_along(data$queries), function(i) {
+    q <- data$queries[[i]]
+    tibble(
+      query_idx = i - 1,
+      Query_ID = as.character(q$id),
+      Query_alt = as.character(q$alt),
+      Query_len = as.integer(q$len),
+      Query_nsites = as.integer(q$nsites),
+      Query_MEME_evalue = to_num(q$evalue)
+    )
+  })
+  
+  targets <- purrr::map_dfr(seq_along(data$targets), function(i) {
+    t <- data$targets[[i]]
+    tibble(
+      target_idx = i - 1,
+      Target_ID = as.character(t$id),
+      Target_alt = ifelse(is.null(t$alt), NA_character_, as.character(t$alt)),
+      Target_len = as.integer(t$len),
+      Target_nsites = as.integer(t$nsites),
+      Target_evalue = to_num(t$evalue),
+      Target_url = ifelse(is.null(t$url), NA_character_, as.character(t$url))
+    )
+  })
+  
+  matches <- purrr::map_dfr(seq_along(data$all_matches), function(i) {
+    one <- data$all_matches[[i]]
+    qidx <- one$idx
+    
+    if (length(one$matches) == 0) return(tibble())
+    
+    purrr::map_dfr(one$matches, function(m) {
+      tibble(
+        query_idx = qidx,
+        target_idx = m$idx,
+        rc = ifelse(is.null(m$rc), NA, m$rc),
+        offset = ifelse(is.null(m$off), NA_integer_, m$off),
+        pvalue = to_num(m$pv),
+        evalue = to_num(m$ev),
+        qvalue = to_num(m$qv)
+      )
+    })
+  })
+  
+  matches %>%
+    left_join(queries, by = "query_idx") %>%
+    left_join(targets, by = "target_idx")
+}
+
+if (file.exists(tomtom_tsv_file)) {
+  
+  tomtom_raw <- read_tsv(
+    tomtom_tsv_file,
+    comment = "#",
+    show_col_types = FALSE
+  )
+  
+  colnames(tomtom_raw) <- make.names(colnames(tomtom_raw))
+  
+  tomtom_matches <- tomtom_raw %>%
+    transmute(
+      Query_ID = as.character(Query_ID),
+      Query_alt = if ("Query_alt_ID" %in% colnames(.)) as.character(Query_alt_ID) else as.character(Query_ID),
+      Target_ID = as.character(Target_ID),
+      Target_alt = if ("Target_alt_ID" %in% colnames(.)) as.character(Target_alt_ID) else NA_character_,
+      pvalue = if ("p.value" %in% colnames(.)) to_num(p.value) else NA_real_,
+      evalue = if ("E.value" %in% colnames(.)) to_num(E.value) else NA_real_,
+      qvalue = if ("q.value" %in% colnames(.)) to_num(q.value) else NA_real_
+    )
+  
+} else if (file.exists(tomtom_html_file)) {
+  
+  tomtom_matches <- parse_tomtom_html(tomtom_html_file)
+  
+} else {
+  stop("Cannot find Tomtom file: ", tomtom_html_file, " or ", tomtom_tsv_file)
+}
+
+tomtom_matches <- tomtom_matches %>%
+  mutate(
+    Query_ID = as.character(Query_ID),
+    Query_alt = as.character(Query_alt),
+    Query_MEME = str_extract(paste(Query_ID, Query_alt), "MEME-[0-9]+"),
+    
+    Target_ID = as.character(Target_ID),
+    Target_alt = as.character(Target_alt),
+    
+    Target_family_raw = str_extract(Target_ID, "^[^_]+"),
+    Target_family = normalize_tf_family(Target_family_raw),
+    
+    Target_TF_symbol = case_when(
+      !is.na(Target_alt) & Target_alt != "" ~ Target_alt,
+      str_detect(Target_ID, "tnt\\.") ~ str_match(Target_ID, "tnt\\.([^_]+)")[, 2],
+      TRUE ~ Target_ID
+    ),
+    
+    Target_AGI = str_extract(Target_alt, "AT[1-5CM]G[0-9]+"),
+    
+    pvalue_Tomtom = to_num(pvalue),
+    evalue_Tomtom = to_num(evalue),
+    qvalue_Tomtom = to_num(qvalue),
+    
+    Tomtom_confidence = case_when(
+      !is.na(qvalue_Tomtom) & qvalue_Tomtom <= 0.05 ~ "high_q<=0.05",
+      !is.na(qvalue_Tomtom) & qvalue_Tomtom <= 0.10 ~ "moderate_q<=0.10",
+      !is.na(qvalue_Tomtom) & qvalue_Tomtom <= 0.20 ~ "low_q<=0.20",
+      TRUE ~ "top_hit_only"
+    )
+  ) %>%
+  arrange(Query_alt, qvalue_Tomtom, evalue_Tomtom, pvalue_Tomtom)
+
+tomtom_keep <- tomtom_matches %>%
+  group_by(Query_alt) %>%
+  arrange(qvalue_Tomtom, evalue_Tomtom, pvalue_Tomtom, .by_group = TRUE) %>%
+  mutate(rank_within_motif = row_number()) %>%
+  filter(qvalue_Tomtom <= tomtom_q_cutoff | rank_within_motif <= top_tomtom_hits_per_motif) %>%
+  ungroup()
+
+tomtom_alias <- tomtom_keep %>%
+  dplyr::select(
+    Query_ID,
+    Query_alt,
+    Query_MEME,
+    Target_ID,
+    Target_alt,
+    Target_family_raw,
+    Target_family,
+    Target_TF_symbol,
+    Target_AGI,
+    pvalue_Tomtom,
+    evalue_Tomtom,
+    qvalue_Tomtom,
+    Tomtom_confidence,
+    rank_within_motif
+  ) %>%
+  make_motif_alias_long(
+    motif_cols = c("Query_ID", "Query_alt", "Query_MEME"),
+    keep_cols = c(
+      "Target_ID", "Target_alt", "Target_family_raw", "Target_family",
+      "Target_TF_symbol", "Target_AGI",
+      "pvalue_Tomtom", "evalue_Tomtom", "qvalue_Tomtom",
+      "Tomtom_confidence", "rank_within_motif"
+    )
+  ) %>%
+  dplyr::select(-row_id_tmp) %>%
+  distinct()
+
+write_tsv(tomtom_matches, file.path(outdir, "Tomtom_all_matches_parsed.tsv"))
+write_tsv(tomtom_keep, file.path(outdir, "Tomtom_kept_matches_for_TF_mapping.tsv"))
+write_tsv(tomtom_alias, file.path(outdir, "Tomtom_motif_alias_table.tsv"))
+
+cat("\n===== Tomtom check =====\n")
+cat("All Tomtom matches:", nrow(tomtom_matches), "\n")
+cat("Kept Tomtom matches:", nrow(tomtom_keep), "\n")
+cat("Tomtom motif aliases:", n_distinct(tomtom_alias$Motif), "\n")
+print(sort(unique(tomtom_alias$Target_family)))
+
+############################################################
+## 5. Read FIMO results and build motif alias table
+############################################################
+
+read_fimo_fixed <- function(file) {
+  
+  if (!file.exists(file)) {
+    stop("Cannot find FIMO file: ", file)
+  }
+  
+  df <- read_tsv(
+    file,
+    comment = "#",
+    show_col_types = FALSE
+  )
+  
+  colnames(df) <- make.names(colnames(df))
+  
+  if (!all(c("motif_id", "sequence_name", "start", "stop", "strand", "score", "p.value") %in% colnames(df))) {
+    stop("FIMO file does not have expected columns: ", file)
+  }
+  
+  df %>%
+    mutate(
+      motif_id = as.character(motif_id),
+      motif_alt_id = if ("motif_alt_id" %in% colnames(.)) as.character(motif_alt_id) else NA_character_,
+      Motif_MEME = str_extract(paste(motif_id, motif_alt_id), "MEME-[0-9]+"),
+      
+      sequence_name_raw = as.character(sequence_name),
+      Gene = clean_gene_id(sequence_name_raw),
+      
+      start = as.integer(start),
+      stop = as.integer(stop),
+      pvalue_FIMO = to_num(p.value),
+      qvalue_FIMO = if ("q.value" %in% colnames(.)) to_num(q.value) else NA_real_,
+      score_FIMO = to_num(score),
+      matched_sequence = if ("matched_sequence" %in% colnames(.)) as.character(matched_sequence) else NA_character_
+    ) %>%
+    filter(
+      pvalue_FIMO <= fimo_p_cutoff |
+        (!is.na(qvalue_FIMO) & qvalue_FIMO <= fimo_q_cutoff)
+    )
+}
+
+fimo_nlr <- read_fimo_fixed(fimo_nlr_file)
+fimo_all <- read_fimo_fixed(fimo_all_file)
+
+fimo_nlr_alias <- fimo_nlr %>%
+  dplyr::select(
+    motif_id,
+    motif_alt_id,
+    Motif_MEME,
+    NLR_gene = Gene,
+    sequence_name_raw,
+    start,
+    stop,
+    strand,
+    pvalue_FIMO,
+    qvalue_FIMO,
+    score_FIMO,
+    matched_sequence
+  ) %>%
+  make_motif_alias_long(
+    motif_cols = c("motif_id", "motif_alt_id", "Motif_MEME"),
+    keep_cols = c(
+      "NLR_gene", "sequence_name_raw", "start", "stop", "strand",
+      "pvalue_FIMO", "qvalue_FIMO", "score_FIMO", "matched_sequence"
+    )
+  ) %>%
+  dplyr::select(-row_id_tmp) %>%
+  filter(!is.na(NLR_gene), NLR_gene != "") %>%
+  distinct()
+
+fimo_all_alias <- fimo_all %>%
+  dplyr::select(
+    motif_id,
+    motif_alt_id,
+    Motif_MEME,
+    Gene,
+    sequence_name_raw,
+    start,
+    stop,
+    strand,
+    pvalue_FIMO,
+    qvalue_FIMO,
+    score_FIMO,
+    matched_sequence
+  ) %>%
+  make_motif_alias_long(
+    motif_cols = c("motif_id", "motif_alt_id", "Motif_MEME"),
+    keep_cols = c(
+      "Gene", "sequence_name_raw", "start", "stop", "strand",
+      "pvalue_FIMO", "qvalue_FIMO", "score_FIMO", "matched_sequence"
+    )
+  ) %>%
+  dplyr::select(-row_id_tmp) %>%
+  filter(!is.na(Gene), Gene != "") %>%
+  distinct()
+
+write_tsv(fimo_nlr, file.path(outdir, "FIMO_DE_NLR_promoter_hits_filtered.tsv"))
+write_tsv(fimo_all, file.path(outdir, "FIMO_all_gene_promoter_hits_filtered.tsv"))
+write_tsv(fimo_nlr_alias, file.path(outdir, "FIMO_DE_NLR_motif_alias_hits.tsv"))
+
+cat("\n===== FIMO check =====\n")
+cat("FIMO NLR hit rows:", nrow(fimo_nlr), "\n")
+cat("FIMO NLR alias rows:", nrow(fimo_nlr_alias), "\n")
+cat("FIMO unique NLR genes:", n_distinct(fimo_nlr_alias$NLR_gene), "\n")
+cat("FIMO unique motif aliases:", n_distinct(fimo_nlr_alias$Motif), "\n")
+
+motif_overlap <- intersect(unique(tomtom_alias$Motif), unique(fimo_nlr_alias$Motif))
+
+cat("\n===== Motif overlap check =====\n")
+cat("Tomtom motif aliases:", length(unique(tomtom_alias$Motif)), "\n")
+cat("FIMO motif aliases:", length(unique(fimo_nlr_alias$Motif)), "\n")
+cat("Overlapped motifs:", length(motif_overlap), "\n")
+print(motif_overlap)
+
+if (length(motif_overlap) == 0) {
+  cat("\nTomtom motif examples:\n")
+  print(head(sort(unique(tomtom_alias$Motif)), 30))
+  
+  cat("\nFIMO motif examples:\n")
+  print(head(sort(unique(fimo_nlr_alias$Motif)), 30))
+  
+  stop("Tomtom and FIMO motif IDs do not overlap. Check motif_id / motif_alt_id in FIMO and Query_ID / Query_alt in Tomtom.")
+}
+
+############################################################
+## 6. Summarize motif occurrence per NLR promoter
+############################################################
+
+nlr_motif_hits <- fimo_nlr_alias %>%
+  group_by(NLR_gene, Motif) %>%
+  summarise(
+    FIMO_hit_count = n(),
+    FIMO_best_pvalue = min(pvalue_FIMO, na.rm = TRUE),
+    FIMO_best_qvalue = suppressWarnings(min(qvalue_FIMO, na.rm = TRUE)),
+    FIMO_best_score = max(score_FIMO, na.rm = TRUE),
+    FIMO_best_start = start[which.min(pvalue_FIMO)][1],
+    FIMO_best_stop = stop[which.min(pvalue_FIMO)][1],
+    FIMO_best_strand = strand[which.min(pvalue_FIMO)][1],
+    FIMO_best_sequence = matched_sequence[which.min(pvalue_FIMO)][1],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    FIMO_best_qvalue = ifelse(is.infinite(FIMO_best_qvalue), NA_real_, FIMO_best_qvalue)
+  )
+
+write_tsv(
+  nlr_motif_hits,
+  file.path(outdir, "NLR_promoter_motif_occurrence_summary.tsv")
+)
+
+############################################################
+## 7. Motif enrichment in NLR promoters versus all promoters
+############################################################
+
+nlr_background_ids <- unique(fimo_nlr_alias$NLR_gene)
+all_background_ids <- unique(fimo_all_alias$Gene)
+
+motif_enrichment <- unique(c(fimo_nlr_alias$Motif, fimo_all_alias$Motif)) %>%
+  purrr::map_dfr(function(m) {
+    
+    nlr_with <- fimo_nlr_alias %>%
+      filter(Motif == m) %>%
+      pull(NLR_gene) %>%
+      unique()
+    
+    all_with <- fimo_all_alias %>%
+      filter(Motif == m) %>%
+      pull(Gene) %>%
+      unique()
+    
+    bg_non_nlr <- setdiff(all_background_ids, nlr_background_ids)
+    
+    nlr_a <- sum(nlr_background_ids %in% nlr_with)
+    nlr_b <- length(nlr_background_ids) - nlr_a
+    
+    bg_a <- sum(bg_non_nlr %in% all_with)
+    bg_b <- length(bg_non_nlr) - bg_a
+    
+    mat <- matrix(
+      c(nlr_a, nlr_b, bg_a, bg_b),
+      nrow = 2,
+      byrow = TRUE
+    )
+    
+    ft <- fisher.test(mat)
+    
+    tibble(
+      Motif = m,
+      NLR_with_motif = nlr_a,
+      NLR_without_motif = nlr_b,
+      Background_with_motif = bg_a,
+      Background_without_motif = bg_b,
+      OddsRatio = unname(ft$estimate),
+      pvalue = ft$p.value
+    )
+  }) %>%
+  mutate(
+    FDR = p.adjust(pvalue, method = "BH"),
+    Motif_enriched_in_NLR = FDR < 0.05 & OddsRatio > 1
+  ) %>%
+  arrange(FDR, desc(OddsRatio))
+
+write_tsv(
+  motif_enrichment,
+  file.path(outdir, "Motif_enrichment_DE_NLR_vs_background_promoters.tsv")
+)
+
+############################################################
+## 8. Read NLR master table
+############################################################
+
+if (!file.exists(nlr_master_file)) {
+  stop("Cannot find NLR master table: ", nlr_master_file)
+}
+
+nlr_master <- read_tsv(
+  nlr_master_file,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Gene = clean_gene_id(Gene),
+    Type = str_to_upper(as.character(Type))
+  ) %>%
+  filter(Type %in% tcr_levels)
+
+if ("DE_LRT" %in% colnames(nlr_master)) {
+  nlr_master <- nlr_master %>%
+    mutate(DE_LRT = as_logical_safe(DE_LRT))
+} else if ("padj" %in% colnames(nlr_master)) {
+  nlr_master <- nlr_master %>%
+    mutate(DE_LRT = !is.na(padj) & padj < 0.05)
+} else {
+  stop("NLR master table must contain DE_LRT or padj.")
+}
+
+############################################################
+## 9. Prepare WGCNA module table
+############################################################
+
+if (!exists("gene_module_df")) {
+  if (exists("moduleColors") && exists("wgcna_data")) {
+    gene_module_df <- tibble(
+      Gene = colnames(wgcna_data),
+      Module = as.character(moduleColors)
+    )
+  } else {
+    warning("gene_module_df not found. SameModule evidence will be unavailable.")
+    gene_module_df <- tibble(Gene = character(), Module = character())
+  }
+}
+
+gene_module_df_clean <- as.data.frame(gene_module_df) %>%
+  as_tibble()
+
+if (nrow(gene_module_df_clean) > 0) {
+  
+  if (!"Gene" %in% colnames(gene_module_df_clean)) {
+    colnames(gene_module_df_clean)[1] <- "Gene"
+  }
+  
+  if (!"Module" %in% colnames(gene_module_df_clean)) {
+    colnames(gene_module_df_clean)[2] <- "Module"
+  }
+  
+  gene_module_df_clean <- gene_module_df_clean %>%
+    transmute(
+      Gene = clean_gene_id(Gene),
+      Module = as.character(Module)
+    ) %>%
+    distinct(Gene, .keep_all = TRUE)
+}
+
+############################################################
+## 10. DESeq2 LRT results for all genes, including TFs
+############################################################
+
+if (exists("res")) {
+  res_lrt_all <- as.data.frame(res) %>%
+    rownames_to_column("Gene") %>%
+    mutate(Gene = clean_gene_id(Gene)) %>%
+    dplyr::select(Gene, baseMean, stat, pvalue, padj) %>%
+    distinct(Gene, .keep_all = TRUE)
+} else {
+  res_lrt_all <- tibble(
+    Gene = character(),
+    baseMean = numeric(),
+    stat = numeric(),
+    pvalue = numeric(),
+    padj = numeric()
+  )
+  warning("Object 'res' not found. TF_DE_LRT evidence will be unavailable.")
+}
+
+############################################################
+## 11. Motif -> candidate TF mapping
+############################################################
+
+cat("\n===== TF family overlap check =====\n")
+cat("Tomtom target families:\n")
+print(sort(unique(tomtom_alias$Target_family)))
+
+cat("\nPine TF families:\n")
+print(sort(unique(tf_anno$TF_family)))
+
+family_overlap <- intersect(
+  sort(unique(tomtom_alias$Target_family)),
+  sort(unique(tf_anno$TF_family))
+)
+
+cat("\nOverlapped TF families:", length(family_overlap), "\n")
+print(family_overlap)
+
+if (length(family_overlap) == 0) {
+  stop("No overlap between Tomtom-inferred TF families and pine TF annotation families.")
+}
+
+motif_tf_candidates <- tomtom_alias %>%
+  inner_join(
+    tf_anno,
+    by = c("Target_family" = "TF_family")
+  ) %>%
+  mutate(
+    MappingEvidence = "TF_family_match"
+  ) %>%
+  distinct(Motif, TF_gene, Target_ID, .keep_all = TRUE)
+
+write_tsv(
+  motif_tf_candidates,
+  file.path(outdir, "Motif_to_candidate_TF_mapping.tsv")
+)
+
+cat("\n===== Motif to TF candidate mapping check =====\n")
+cat("Rows:", nrow(motif_tf_candidates), "\n")
+cat("Candidate TFs:", n_distinct(motif_tf_candidates$TF_gene), "\n")
+print(
+  motif_tf_candidates %>%
+    count(Motif, Target_family, name = "candidate_TF_count") %>%
+    arrange(Motif, desc(candidate_TF_count))
+)
+
+############################################################
+## 12. Build preliminary TF-motif-NLR pairs
+############################################################
+
+candidate_pairs_before_expr <- nlr_motif_hits %>%
+  inner_join(
+    motif_tf_candidates,
+    by = "Motif"
+  ) %>%
+  distinct(TF_gene, NLR_gene, Motif, Target_ID, .keep_all = TRUE)
+
+cat("\n===== Candidate pairs before expression filtering =====\n")
+cat("Rows:", nrow(candidate_pairs_before_expr), "\n")
+cat("TFs:", n_distinct(candidate_pairs_before_expr$TF_gene), "\n")
+cat("NLRs:", n_distinct(candidate_pairs_before_expr$NLR_gene), "\n")
+
+candidate_pairs_pre <- candidate_pairs_before_expr %>%
+  mutate(
+    TF_gene = clean_gene_id(TF_gene),
+    NLR_gene = clean_gene_id(NLR_gene)
+  ) %>%
+  filter(
+    TF_gene %in% colnames(datExpr),
+    NLR_gene %in% colnames(datExpr)
+  )
+
+cat("\n===== Candidate pairs after expression filtering =====\n")
+cat("Rows:", nrow(candidate_pairs_pre), "\n")
+cat("TFs:", n_distinct(candidate_pairs_pre$TF_gene), "\n")
+cat("NLRs:", n_distinct(candidate_pairs_pre$NLR_gene), "\n")
+
+cat("TFs in expression:", sum(unique(candidate_pairs_before_expr$TF_gene) %in% colnames(datExpr)), "/", n_distinct(candidate_pairs_before_expr$TF_gene), "\n")
+cat("NLRs in expression:", sum(unique(candidate_pairs_before_expr$NLR_gene) %in% colnames(datExpr)), "/", n_distinct(candidate_pairs_before_expr$NLR_gene), "\n")
+
+write_tsv(
+  candidate_pairs_before_expr,
+  file.path(outdir, "Candidate_TF_motif_NLR_pairs_before_expression_filter.tsv")
+)
+
+write_tsv(
+  candidate_pairs_pre,
+  file.path(outdir, "Candidate_TF_motif_NLR_pairs_preliminary.tsv")
+)
+
+if (nrow(candidate_pairs_pre) == 0) {
+  cat("\nExample TF IDs before expression filtering:\n")
+  print(head(unique(candidate_pairs_before_expr$TF_gene), 20))
+  
+  cat("\nExample NLR IDs before expression filtering:\n")
+  print(head(unique(candidate_pairs_before_expr$NLR_gene), 20))
+  
+  cat("\nExample expression gene IDs:\n")
+  print(head(colnames(datExpr), 20))
+  
+  stop("No candidate TF-NLR pairs after expression filtering. Check TF/NLR IDs.")
+}
+
+############################################################
+## 13. Compute TF-NLR expression correlations
+############################################################
+
+gene_sd <- sapply(datExpr, function(x) sd(x, na.rm = TRUE))
+nonzero_genes <- names(gene_sd)[!is.na(gene_sd) & gene_sd > 0]
+
+candidate_pairs_valid <- candidate_pairs_pre %>%
+  filter(
+    TF_gene %in% nonzero_genes,
+    NLR_gene %in% nonzero_genes
+  )
+
+cat("\n===== Candidate pairs after variance filtering =====\n")
+cat("Rows:", nrow(candidate_pairs_valid), "\n")
+cat("TFs:", n_distinct(candidate_pairs_valid$TF_gene), "\n")
+cat("NLRs:", n_distinct(candidate_pairs_valid$NLR_gene), "\n")
+
+if (nrow(candidate_pairs_valid) == 0) {
+  stop("No valid TF-NLR pairs after variance filtering.")
+}
+
+compute_cor_for_pairs_fixed <- function(pair_df, datExpr) {
+  
+  pair_df <- pair_df %>%
+    distinct(TF_gene, NLR_gene)
+  
+  tf_genes <- intersect(unique(pair_df$TF_gene), colnames(datExpr))
+  nlr_genes <- intersect(unique(pair_df$NLR_gene), colnames(datExpr))
+  
+  if (length(tf_genes) == 0 || length(nlr_genes) == 0) {
+    return(
+      tibble(
+        TF_gene = character(),
+        NLR_gene = character(),
+        TF_NLR_cor = numeric(),
+        TF_NLR_abs_cor = numeric(),
+        TF_NLR_cor_pvalue = numeric()
+      )
+    )
+  }
+  
+  tf_mat <- as.matrix(datExpr[, tf_genes, drop = FALSE])
+  nlr_mat <- as.matrix(datExpr[, nlr_genes, drop = FALSE])
+  
+  cor_mat <- cor(
+    tf_mat,
+    nlr_mat,
+    use = "pairwise.complete.obs",
+    method = "pearson"
+  )
+  
+  p_mat <- WGCNA::corPvalueStudent(
+    cor_mat,
+    nSamples = nrow(datExpr)
+  )
+  
+  cor_long <- expand.grid(
+    TF_gene = rownames(cor_mat),
+    NLR_gene = colnames(cor_mat),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    as_tibble() %>%
+    mutate(
+      TF_NLR_cor = as.numeric(as.vector(cor_mat)),
+      TF_NLR_abs_cor = abs(TF_NLR_cor),
+      TF_NLR_cor_pvalue = as.numeric(as.vector(p_mat))
+    )
+  
+  pair_df %>%
+    left_join(cor_long, by = c("TF_gene", "NLR_gene")) %>%
+    filter(!is.na(TF_NLR_cor))
+}
+
+pair_cor <- compute_cor_for_pairs_fixed(
+  candidate_pairs_valid,
+  datExpr
+) %>%
+  mutate(
+    TF_NLR_cor_FDR = p.adjust(TF_NLR_cor_pvalue, method = "BH"),
+    CorDirection = case_when(
+      TF_NLR_cor > 0 ~ "positive",
+      TF_NLR_cor < 0 ~ "negative",
+      TRUE ~ "zero"
+    )
+  )
+
+cat("\n===== TF-NLR correlation result =====\n")
+cat("Rows:", nrow(pair_cor), "\n")
+cat("TFs:", n_distinct(pair_cor$TF_gene), "\n")
+cat("NLRs:", n_distinct(pair_cor$NLR_gene), "\n")
+print(
+  pair_cor %>%
+    arrange(desc(TF_NLR_abs_cor)) %>%
+    slice_head(n = 20)
+)
+
+write_tsv(
+  pair_cor,
+  file.path(outdir, "TF_NLR_expression_correlations.tsv")
+)
+
+if (nrow(pair_cor) == 0) {
+  stop("No TF-NLR correlations were calculated.")
+}
+
+############################################################
+## 14. Add DE, WGCNA, NLR metadata, motif enrichment
+############################################################
+
+tf_de_info <- tf_anno %>%
+  dplyr::select(
+    TF_gene,
+    TF_family,
+    TF_family_raw,
+    TF_name,
+    any_of(c("Arabidopsis_homolog", "Arabidopsis_hit", "Ath_pident", "Ath_evalue", "Ath_bitscore"))
+  ) %>%
+  left_join(
+    res_lrt_all %>%
+      rename(
+        TF_baseMean = baseMean,
+        TF_stat = stat,
+        TF_pvalue = pvalue,
+        TF_padj = padj
+      ),
+    by = c("TF_gene" = "Gene")
+  ) %>%
+  mutate(
+    TF_DE_LRT = !is.na(TF_padj) & TF_padj < 0.05
+  ) %>%
+  left_join(
+    gene_module_df_clean %>%
+      rename(TF_module = Module),
+    by = c("TF_gene" = "Gene")
+  )
+
+nlr_info <- nlr_master %>%
+  dplyr::select(
+    any_of(c(
+      "Gene", "Type", "baseMean", "stat", "pvalue", "padj", "DE_LRT",
+      "Cluster", "max_abs_log2FC", "log2FC_at_max",
+      "main_response_time", "direction_at_max", "response_strength",
+      "Wald_sig_timepoints"
+    ))
+  ) %>%
+  rename(
+    NLR_gene = Gene,
+    NLR_Type = Type,
+    NLR_baseMean = baseMean,
+    NLR_stat = stat,
+    NLR_pvalue = pvalue,
+    NLR_padj = padj,
+    NLR_DE_LRT = DE_LRT
+  ) %>%
+  mutate(
+    NLR_DE_LRT = as_logical_safe(NLR_DE_LRT)
+  ) %>%
+  left_join(
+    gene_module_df_clean %>%
+      rename(NLR_module = Module),
+    by = c("NLR_gene" = "Gene")
+  )
+
+candidate_edges <- candidate_pairs_valid %>%
+  left_join(pair_cor, by = c("TF_gene", "NLR_gene")) %>%
+  left_join(tf_de_info, by = "TF_gene") %>%
+  left_join(nlr_info, by = "NLR_gene") %>%
+  left_join(
+    motif_enrichment %>%
+      dplyr::select(
+        Motif,
+        Motif_OddsRatio = OddsRatio,
+        Motif_enrichment_pvalue = pvalue,
+        Motif_enrichment_FDR = FDR,
+        Motif_enriched_in_NLR
+      ),
+    by = "Motif"
+  ) %>%
+  mutate(
+    SameModule = !is.na(TF_module) & !is.na(NLR_module) & TF_module == NLR_module,
+    
+    Tomtom_pass_q = !is.na(qvalue_Tomtom) & qvalue_Tomtom <= tomtom_q_cutoff,
+    
+    FIMO_pass = FIMO_best_pvalue <= fimo_p_cutoff |
+      (!is.na(FIMO_best_qvalue) & FIMO_best_qvalue <= fimo_q_cutoff),
+    
+    Cor_pass = !is.na(TF_NLR_abs_cor) &
+      TF_NLR_abs_cor >= min_abs_cor &
+      TF_NLR_cor_pvalue <= max_cor_pvalue,
+    
+    EvidenceScore =
+      1 +
+      if_else(Tomtom_pass_q, 1, 0) +
+      if_else(Motif_enriched_in_NLR, 1, 0) +
+      if_else(Cor_pass, 1, 0) +
+      if_else(TF_DE_LRT, 1, 0) +
+      if_else(SameModule, 1, 0),
+    
+    EvidenceClass = case_when(
+      EvidenceScore >= 5 ~ "High",
+      EvidenceScore >= 3 ~ "Medium",
+      TRUE ~ "Low"
+    ),
+    
+    EdgeDirection = case_when(
+      TF_NLR_cor > 0 ~ "positive_candidate_activation",
+      TF_NLR_cor < 0 ~ "negative_candidate_repression",
+      TRUE ~ "unknown"
+    )
+  )
+
+candidate_edges_filtered <- candidate_edges %>%
+  filter(Cor_pass) %>%
+  { if (require_TF_DE) filter(., TF_DE_LRT) else . } %>%
+  { if (require_same_module) filter(., SameModule) else . } %>%
+  arrange(
+    desc(EvidenceScore),
+    desc(TF_NLR_abs_cor),
+    TF_NLR_cor_pvalue,
+    qvalue_Tomtom,
+    FIMO_best_pvalue
+  )
+
+write_tsv(
+  candidate_edges,
+  file.path(outdir, "Candidate_TF_NLR_edges_all_before_correlation_filter.tsv")
+)
+
+write_tsv(
+  candidate_edges_filtered,
+  file.path(outdir, "Candidate_TF_NLR_edges.tsv")
+)
+
+cat("\n===== Candidate TF-NLR edges after correlation filtering =====\n")
+cat("Edges:", nrow(candidate_edges_filtered), "\n")
+cat("TFs:", n_distinct(candidate_edges_filtered$TF_gene), "\n")
+cat("NLRs:", n_distinct(candidate_edges_filtered$NLR_gene), "\n")
+
+if (nrow(candidate_edges_filtered) == 0) {
+  warning(
+    "No TF-NLR edges passed correlation threshold. ",
+    "Try lowering min_abs_cor to 0.60 or max_cor_pvalue to 0.10."
+  )
+}
+
+############################################################
+## 15. Cytoscape edge table
+############################################################
+
+cyto_edges <- candidate_edges_filtered %>%
+  transmute(
+    Source = TF_gene,
+    Target = NLR_gene,
+    EdgeType = "TF_to_NLR_candidate",
+    Motif,
+    TF_family,
+    TF_name.x,
+    NLR_Type,
+    Correlation = TF_NLR_cor,
+    abs_cor = TF_NLR_abs_cor,
+    cor_pvalue = TF_NLR_cor_pvalue,
+    cor_FDR = TF_NLR_cor_FDR,
+    Direction = CorDirection,
+    EdgeDirection,
+    EvidenceScore,
+    EvidenceClass,
+    SameModule,
+    TF_DE_LRT,
+    NLR_DE_LRT,
+    TF_module,
+    NLR_module,
+    FIMO_hit_count,
+    FIMO_best_pvalue,
+    FIMO_best_qvalue,
+    FIMO_best_score,
+    FIMO_best_start,
+    FIMO_best_stop,
+    FIMO_best_strand,
+    FIMO_best_sequence,
+    Target_ID_Tomtom = Target_ID,
+    Target_TF_symbol,
+    Target_family,
+    pvalue_Tomtom,
+    evalue_Tomtom,
+    qvalue_Tomtom,
+    Tomtom_confidence,
+    Motif_OddsRatio,
+    Motif_enrichment_FDR,
+    Motif_enriched_in_NLR,
+    MappingEvidence
+  )
+
+write_tsv(
+  cyto_edges,
+  file.path(outdir, "Cytoscape_TF_NLR_edges.tsv")
+)
+
+############################################################
+## 16. Cytoscape node table
+############################################################
+
+if (nrow(cyto_edges) > 0) {
+  
+  tf_nodes <- cyto_edges %>%
+    distinct(Gene = Source) %>%
+    left_join(
+      tf_de_info,
+      by = c("Gene" = "TF_gene")
+    ) %>%
+    mutate(
+      NodeType = "TF",
+      NodeClass = paste0("TF_", TF_family),
+      Type = TF_family,
+      Module = TF_module,
+      DE_LRT = TF_DE_LRT,
+      padj = TF_padj
+    )
+  
+  nlr_nodes <- cyto_edges %>%
+    distinct(Gene = Target) %>%
+    left_join(
+      nlr_info,
+      by = c("Gene" = "NLR_gene")
+    ) %>%
+    mutate(
+      NodeType = "NLR",
+      NodeClass = paste0("NLR_", NLR_Type),
+      Type = NLR_Type,
+      Module = NLR_module,
+      DE_LRT = NLR_DE_LRT,
+      padj = NLR_padj
+    )
+  
+  nodes <- bind_rows(
+    tf_nodes %>%
+      dplyr::select(
+        Gene, NodeType, NodeClass, Type, Module, DE_LRT, padj,
+        TF_family, TF_family_raw, TF_name,
+        any_of(c("Arabidopsis_homolog", "Arabidopsis_hit", "Ath_pident", "Ath_evalue", "Ath_bitscore")),
+        TF_baseMean, TF_stat, TF_pvalue, TF_padj
+      ),
+    nlr_nodes %>%
+      dplyr::select(
+        Gene, NodeType, NodeClass, Type, Module, DE_LRT, padj,
+        NLR_Type, NLR_baseMean, NLR_stat, NLR_pvalue, NLR_padj,
+        any_of(c(
+          "Cluster", "max_abs_log2FC", "log2FC_at_max",
+          "main_response_time", "direction_at_max",
+          "response_strength", "Wald_sig_timepoints"
+        ))
+      )
+  ) %>%
+    distinct(Gene, .keep_all = TRUE)
+  
+  degree_out <- cyto_edges %>%
+    count(Source, name = "OutDegree") %>%
+    rename(Gene = Source)
+  
+  degree_in <- cyto_edges %>%
+    count(Target, name = "InDegree") %>%
+    rename(Gene = Target)
+  
+  weighted_degree <- bind_rows(
+    cyto_edges %>% transmute(Gene = Source, weight = abs_cor),
+    cyto_edges %>% transmute(Gene = Target, weight = abs_cor)
+  ) %>%
+    group_by(Gene) %>%
+    summarise(
+      WeightedDegree = sum(weight, na.rm = TRUE),
+      MeanAbsCor = mean(weight, na.rm = TRUE),
+      MaxAbsCor = max(weight, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  nodes <- nodes %>%
+    left_join(degree_out, by = "Gene") %>%
+    left_join(degree_in, by = "Gene") %>%
+    left_join(weighted_degree, by = "Gene") %>%
+    mutate(
+      OutDegree = replace_na(OutDegree, 0L),
+      InDegree = replace_na(InDegree, 0L),
+      Degree = OutDegree + InDegree,
+      WeightedDegree = replace_na(WeightedDegree, 0),
+      MeanAbsCor = replace_na(MeanAbsCor, 0),
+      MaxAbsCor = replace_na(MaxAbsCor, 0)
+    ) %>%
+    arrange(NodeType, desc(Degree), Gene)
+  
+} else {
+  
+  nodes <- tibble(
+    Gene = character(),
+    NodeType = character(),
+    NodeClass = character(),
+    Type = character(),
+    Module = character(),
+    DE_LRT = logical(),
+    padj = numeric(),
+    OutDegree = integer(),
+    InDegree = integer(),
+    Degree = integer(),
+    WeightedDegree = numeric()
+  )
+}
+
+write_tsv(
+  nodes,
+  file.path(outdir, "Cytoscape_TF_NLR_nodes.tsv")
+)
+
+write_tsv(
+  nodes,
+  file.path(outdir, "Candidate_TF_NLR_nodes.tsv")
+)
+
+############################################################
+## 17. Hub ranking tables
+############################################################
+
+tf_hub_ranking <- nodes %>%
+  filter(NodeType == "TF") %>%
+  arrange(desc(OutDegree), desc(WeightedDegree), desc(MaxAbsCor)) %>%
+  mutate(TF_HubRank = row_number()) %>%
+  dplyr::select(
+    TF_HubRank,
+    Gene,
+    TF_name,
+    TF_family,
+    Module,
+    DE_LRT,
+    padj,
+    OutDegree,
+    WeightedDegree,
+    MeanAbsCor,
+    MaxAbsCor,
+    everything()
+  )
+
+nlr_regulatory_target_ranking <- nodes %>%
+  filter(NodeType == "NLR") %>%
+  arrange(desc(InDegree), desc(WeightedDegree), desc(MaxAbsCor)) %>%
+  mutate(NLR_TargetRank = row_number()) %>%
+  dplyr::select(
+    NLR_TargetRank,
+    Gene,
+    Type,
+    Module,
+    DE_LRT,
+    padj,
+    InDegree,
+    WeightedDegree,
+    MeanAbsCor,
+    MaxAbsCor,
+    any_of(c("Cluster", "max_abs_log2FC", "main_response_time", "direction_at_max")),
+    everything()
+  )
+
+write_tsv(
+  tf_hub_ranking,
+  file.path(outdir, "Candidate_TF_hub_ranking.tsv")
+)
+
+write_tsv(
+  nlr_regulatory_target_ranking,
+  file.path(outdir, "Candidate_NLR_regulatory_target_ranking.tsv")
+)
+
+############################################################
+## 18. Summary tables
+############################################################
+
+if (nrow(cyto_edges) > 0) {
+  
+  edge_summary_by_family <- cyto_edges %>%
+    group_by(TF_family) %>%
+    summarise(
+      TF_count = n_distinct(Source),
+      NLR_target_count = n_distinct(Target),
+      Edge_count = n(),
+      High_edges = sum(EvidenceClass == "High"),
+      Medium_edges = sum(EvidenceClass == "Medium"),
+      Low_edges = sum(EvidenceClass == "Low"),
+      Mean_abs_cor = mean(abs_cor, na.rm = TRUE),
+      SameModule_edges = sum(SameModule, na.rm = TRUE),
+      TF_DE_edges = sum(TF_DE_LRT, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Edge_count), desc(High_edges), desc(Mean_abs_cor))
+  
+  edge_summary_by_motif <- cyto_edges %>%
+    group_by(Motif) %>%
+    summarise(
+      TF_family_count = n_distinct(TF_family),
+      TF_count = n_distinct(Source),
+      NLR_target_count = n_distinct(Target),
+      Edge_count = n(),
+      Mean_abs_cor = mean(abs_cor, na.rm = TRUE),
+      Motif_OddsRatio = first(Motif_OddsRatio),
+      Motif_enrichment_FDR = first(Motif_enrichment_FDR),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Edge_count), Motif_enrichment_FDR)
+  
+} else {
+  
+  edge_summary_by_family <- tibble()
+  edge_summary_by_motif <- tibble()
+}
+
+write_tsv(
+  edge_summary_by_family,
+  file.path(outdir, "TF_NLR_edge_summary_by_TF_family.tsv")
+)
+
+write_tsv(
+  edge_summary_by_motif,
+  file.path(outdir, "TF_NLR_edge_summary_by_motif.tsv")
+)
+
+############################################################
+## 19. Figures
+############################################################
+
+## Fig1 Tomtom motif-family heatmap
+tomtom_family_heatmap <- tomtom_keep %>%
+  group_by(Query_alt, Target_family) %>%
+  summarise(
+    best_qvalue = suppressWarnings(min(qvalue_Tomtom, na.rm = TRUE)),
+    n_matches = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    best_qvalue = ifelse(is.infinite(best_qvalue), NA_real_, best_qvalue),
+    neglog10_q = -log10(pmax(best_qvalue, .Machine$double.xmin))
+  )
+
+if (nrow(tomtom_family_heatmap) > 0) {
+  
+  p1 <- ggplot(
+    tomtom_family_heatmap,
+    aes(x = Query_alt, y = Target_family, fill = neglog10_q)
+  ) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    geom_text(aes(label = n_matches), size = 3) +
+    scale_fill_gradient(low = "white", high = "#B2182B", na.value = "grey90") +
+    labs(
+      title = "Tomtom motif-to-TF-family similarity",
+      x = "MEME motif",
+      y = "Inferred TF family",
+      fill = "-log10(best q)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+  print(p1)
+  save_plot(p1, "Fig1_Tomtom_motif_TF_family_heatmap", width = 8.5, height = 5.5)
+}
+
+## Fig2 motif enrichment
+if (nrow(motif_enrichment) > 0) {
+  
+  p2 <- motif_enrichment %>%
+    mutate(
+      Motif = factor(Motif, levels = rev(Motif)),
+      FDR_plot = pmax(FDR, .Machine$double.xmin)
+    ) %>%
+    ggplot(
+      aes(x = OddsRatio, y = Motif, size = NLR_with_motif, color = -log10(FDR_plot))
+    ) +
+    geom_point(alpha = 0.85) +
+    geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.4) +
+    labs(
+      title = "Motif occurrence enrichment in DE NLR promoters",
+      x = "Odds ratio, DE NLR promoters vs background",
+      y = "MEME motif",
+      size = "NLR promoters with motif",
+      color = "-log10(FDR)"
+    ) +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  print(p2)
+  save_plot(p2, "Fig2_motif_enrichment_in_DE_NLR_promoters", width = 8, height = 5.5)
+}
+
+## Fig3 TF family edge counts
+if (nrow(edge_summary_by_family) > 0) {
+  
+  p3 <- edge_summary_by_family %>%
+    mutate(TF_family = factor(TF_family, levels = rev(TF_family))) %>%
+    ggplot(aes(x = Edge_count, y = TF_family)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = Edge_count), hjust = -0.1, size = 3.5) +
+    scale_x_continuous(
+      limits = c(0, max(edge_summary_by_family$Edge_count, na.rm = TRUE) * 1.15)
+    ) +
+    labs(
+      title = "Candidate TF-NLR regulatory edges by TF family",
+      x = "Candidate TF-NLR edge count",
+      y = "TF family"
+    ) +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  print(p3)
+  save_plot(p3, "Fig3_TF_NLR_edge_counts_by_TF_family", width = 7.5, height = 5.5)
+}
+
+## Fig4 top TF hubs
+if (nrow(tf_hub_ranking) > 0) {
+  
+  top_tf_n <- min(25, nrow(tf_hub_ranking))
+  
+  p4 <- tf_hub_ranking %>%
+    dplyr::slice_head(n = top_tf_n) %>%
+    mutate(
+      Label = ifelse(!is.na(TF_name) & TF_name != "", TF_name, Gene),
+      Label = factor(Label, levels = rev(Label))
+    ) %>%
+    ggplot(aes(x = OutDegree, y = Label, fill = TF_family)) +
+    geom_col(width = 0.7, color = "black", linewidth = 0.2) +
+    labs(
+      title = paste0("Top ", top_tf_n, " candidate TF hubs"),
+      x = "Out-degree to NLR targets",
+      y = "Candidate TF",
+      fill = "TF family"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  print(p4)
+  save_plot(p4, "Fig4_top_candidate_TF_hubs", width = 8, height = 7)
+}
+
+## Fig5 evidence class composition
+if (nrow(cyto_edges) > 0) {
+  
+  p5 <- cyto_edges %>%
+    count(EvidenceClass, name = "Edge_count") %>%
+    mutate(EvidenceClass = factor(EvidenceClass, levels = c("High", "Medium", "Low"))) %>%
+    ggplot(aes(x = EvidenceClass, y = Edge_count, fill = EvidenceClass)) +
+    geom_col(width = 0.65, color = "black", linewidth = 0.25) +
+    geom_text(aes(label = Edge_count), vjust = -0.4, size = 4) +
+    labs(
+      title = "Evidence classes of candidate TF-NLR regulatory edges",
+      x = "Evidence class",
+      y = "Edge count"
+    ) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "none"
+    )
+  
+  print(p5)
+  save_plot(p5, "Fig5_TF_NLR_edge_evidence_classes", width = 6, height = 5)
+}
+
+## Fig6 correlation distribution
+if (nrow(cyto_edges) > 0) {
+  
+  p6 <- ggplot(
+    cyto_edges,
+    aes(x = Correlation, fill = Direction)
+  ) +
+    geom_histogram(bins = 40, color = "white", linewidth = 0.2) +
+    scale_fill_manual(values = c(positive = "#B2182B", negative = "#2166AC", zero = "grey70")) +
+    labs(
+      title = "Expression correlation of candidate TF-NLR edges",
+      x = "TF-NLR expression correlation",
+      y = "Edge count",
+      fill = "Direction"
+    ) +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  print(p6)
+  save_plot(p6, "Fig6_TF_NLR_correlation_distribution", width = 7, height = 5)
+}
+
+############################################################
+## 20. Export text summary
+############################################################
+
+summary_file <- file.path(outdir, "TF_NLR_candidate_regulatory_network_summary.txt")
+
+sink(summary_file)
+
+cat("Candidate TF-NLR regulatory network summary\n")
+cat("==========================================\n\n")
+
+cat("1. Parameters\n")
+cat("Tomtom q cutoff:", tomtom_q_cutoff, "\n")
+cat("Top Tomtom hits per motif:", top_tomtom_hits_per_motif, "\n")
+cat("FIMO p cutoff:", fimo_p_cutoff, "\n")
+cat("FIMO q cutoff:", fimo_q_cutoff, "\n")
+cat("Minimum absolute TF-NLR correlation:", min_abs_cor, "\n")
+cat("Maximum correlation p-value:", max_cor_pvalue, "\n")
+cat("Require TF DE:", require_TF_DE, "\n")
+cat("Require same WGCNA module:", require_same_module, "\n\n")
+
+cat("2. Input diagnostics\n")
+cat("Total TF genes:", nrow(tf_anno), "\n")
+cat("TF genes in datExpr:", sum(tf_anno$TF_gene %in% colnames(datExpr)), "\n")
+cat("Tomtom kept matches:", nrow(tomtom_keep), "\n")
+cat("FIMO NLR motif hits:", nrow(fimo_nlr_alias), "\n")
+cat("Motif overlaps between Tomtom and FIMO:", length(motif_overlap), "\n")
+cat("Candidate pairs before expression filtering:", nrow(candidate_pairs_before_expr), "\n")
+cat("Candidate pairs after expression filtering:", nrow(candidate_pairs_pre), "\n")
+cat("Candidate pairs after variance filtering:", nrow(candidate_pairs_valid), "\n")
+cat("Candidate TF-NLR edges after correlation filtering:", nrow(candidate_edges_filtered), "\n\n")
+
+cat("3. Tomtom motif-to-TF-family summary\n")
+print(
+  tomtom_keep %>%
+    count(Query_alt, Target_family, name = "n_matches") %>%
+    arrange(Query_alt, desc(n_matches))
+)
+cat("\n")
+
+cat("4. Motif enrichment summary\n")
+print(motif_enrichment)
+cat("\n")
+
+cat("5. Candidate edge summary by TF family\n")
+print(edge_summary_by_family)
+cat("\n")
+
+cat("6. Candidate edge summary by motif\n")
+print(edge_summary_by_motif)
+cat("\n")
+
+cat("7. Top candidate TF hubs\n")
+print(
+  tf_hub_ranking %>%
+    dplyr::select(
+      any_of(c(
+        "TF_HubRank", "Gene", "TF_name", "TF_family", "Module",
+        "DE_LRT", "padj", "OutDegree", "WeightedDegree", "MeanAbsCor", "MaxAbsCor"
+      ))
+    ) %>%
+    dplyr::slice_head(n = 30)
+)
+cat("\n")
+
+cat("8. Top candidate NLR regulatory targets\n")
+print(
+  nlr_regulatory_target_ranking %>%
+    dplyr::select(
+      any_of(c(
+        "NLR_TargetRank", "Gene", "Type", "Module", "DE_LRT", "padj",
+        "InDegree", "WeightedDegree", "max_abs_log2FC",
+        "main_response_time", "direction_at_max"
+      ))
+    ) %>%
+    dplyr::slice_head(n = 30)
+)
+cat("\n")
+
+cat("9. Interpretation note\n")
+cat(
+  "This network should be interpreted as a candidate TF-NLR regulatory network. ",
+  "A TF-NLR edge is supported by promoter motif occurrence, Tomtom-inferred TF family similarity, ",
+  "TF-NLR expression correlation, and optional WGCNA module consistency. ",
+  "These edges do not prove direct binding or causal regulation and should be prioritized for future validation.\n",
+  sep = ""
+)
+
+sink()
+
+############################################################
+## 21. Save RDS
+############################################################
+
+saveRDS(
+  list(
+    tf_anno = tf_anno,
+    tomtom_matches = tomtom_matches,
+    tomtom_keep = tomtom_keep,
+    tomtom_alias = tomtom_alias,
+    fimo_nlr = fimo_nlr,
+    fimo_all = fimo_all,
+    fimo_nlr_alias = fimo_nlr_alias,
+    nlr_motif_hits = nlr_motif_hits,
+    motif_enrichment = motif_enrichment,
+    motif_tf_candidates = motif_tf_candidates,
+    candidate_pairs_before_expr = candidate_pairs_before_expr,
+    candidate_pairs_pre = candidate_pairs_pre,
+    candidate_pairs_valid = candidate_pairs_valid,
+    pair_cor = pair_cor,
+    candidate_edges_all = candidate_edges,
+    candidate_edges_filtered = candidate_edges_filtered,
+    cyto_edges = cyto_edges,
+    nodes = nodes,
+    tf_hub_ranking = tf_hub_ranking,
+    nlr_regulatory_target_ranking = nlr_regulatory_target_ranking,
+    edge_summary_by_family = edge_summary_by_family,
+    edge_summary_by_motif = edge_summary_by_motif,
+    parameters = list(
+      tomtom_q_cutoff = tomtom_q_cutoff,
+      top_tomtom_hits_per_motif = top_tomtom_hits_per_motif,
+      fimo_p_cutoff = fimo_p_cutoff,
+      fimo_q_cutoff = fimo_q_cutoff,
+      min_abs_cor = min_abs_cor,
+      max_cor_pvalue = max_cor_pvalue,
+      require_TF_DE = require_TF_DE,
+      require_same_module = require_same_module
+    )
+  ),
+  file.path(outdir, "TF_NLR_candidate_regulatory_network_results.rds")
+)
+
+############################################################
+## 22. Final message
+############################################################
+
+cat("\nDone. Results saved in:\n")
+cat(outdir, "\n\n")
+
+
+cat("Key diagnostics:\n")
+cat("TF genes:", nrow(tf_anno), "\n")
+cat("TF genes in expression:", sum(tf_anno$TF_gene %in% colnames(datExpr)), "\n")
+cat("Motif overlaps between Tomtom and FIMO:", length(motif_overlap), "\n")
+cat("Candidate pairs before expression filtering:", nrow(candidate_pairs_before_expr), "\n")
+cat("Candidate pairs after expression filtering:", nrow(candidate_pairs_pre), "\n")
+cat("Candidate edges after correlation filtering:", nrow(candidate_edges_filtered), "\n")
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(
+  tibble(
+    Metric = c(
+      "TF_genes",
+      "Tomtom_kept_matches",
+      "FIMO_NLR_motif_hits",
+      "Candidate_edges_after_filter",
+      "Candidate_TFs",
+      "Candidate_NLRs"
+    ),
+    Value = c(
+      nrow(tf_anno),
+      nrow(tomtom_keep),
+      nrow(fimo_nlr_alias),
+      nrow(candidate_edges_filtered),
+      dplyr::n_distinct(candidate_edges_filtered$TF_gene),
+      dplyr::n_distinct(candidate_edges_filtered$NLR_gene)
+    )
+  ),
+  n = 20,
+  title = "TF-NLR candidate network diagnostics"
+)
+show_table(candidate_edges_filtered, n = 30, title = "Top candidate TF-NLR edges")
+show_table(tf_hub_ranking, n = 30, title = "Candidate TF hub ranking")
+show_table(nlr_regulatory_target_ranking, n = 30, title = "Candidate NLR regulatory target ranking")
+```

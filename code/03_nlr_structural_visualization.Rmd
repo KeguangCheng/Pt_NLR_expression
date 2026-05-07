@@ -1,0 +1,817 @@
+---
+title: "NLR Structural Visualization"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+
+
+```{r}
+############################################################
+## Step 2. Visualization of TNL/CNL/RNL structural-class results
+## Input files from previous step:
+## 1. NLR_master_TNL_CNL_RNL.tsv
+## 2. NLR_type_DE_summary_TNL_CNL_RNL.tsv
+## 3. NLR_type_Mfuzz_cluster_summary_TNL_CNL_RNL.tsv
+## 4. NLR_type_WGCNA_module_summary_TNL_CNL_RNL.tsv
+## 5. NLR_type_DE_matrix_TNL_CNL_RNL.tsv
+## 6. NLR_type_DE_standardized_residuals_TNL_CNL_RNL.tsv
+############################################################
+
+
+## -----------------------------
+## 0. Settings
+## -----------------------------
+
+tcr_levels <- c("TNL", "CNL", "RNL")
+
+outdir <- analysis_file("figures_TNL_CNL_RNL_structure")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+save_plot <- function(plot_obj, filename, width = 7, height = 5) {
+  ggsave(
+    filename = file.path(outdir, paste0(filename, ".pdf")),
+    plot = plot_obj,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    filename = file.path(outdir, paste0(filename, ".png")),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+type_cols <- c(
+  TNL = "#7B3294",
+  CNL = "#008837",
+  RNL = "#E66101"
+)
+
+cluster_cols <- c(
+  "1" = "#1B9E77",
+  "2" = "#D95F02",
+  "3" = "#7570B3",
+  "4" = "#E7298A",
+  "5" = "#66A61E",
+  "6" = "#E6AB02"
+)
+
+
+## -----------------------------
+## 1. Read result tables
+## -----------------------------
+
+nlr_master <- read_tsv(
+  analysis_file("NLR_master_TNL_CNL_RNL.tsv"),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Cluster = as.character(Cluster),
+    Module = as.character(Module)
+  )
+
+type_de_summary <- read_tsv(
+  analysis_file("NLR_type_DE_summary_TNL_CNL_RNL.tsv"),
+  show_col_types = FALSE
+) %>%
+  mutate(Type = factor(Type, levels = tcr_levels))
+
+type_cluster_table <- read_tsv(
+  analysis_file("NLR_type_Mfuzz_cluster_summary_TNL_CNL_RNL.tsv"),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Cluster = as.character(Cluster)
+  )
+
+type_module_table <- read_tsv(
+  analysis_file("NLR_type_WGCNA_module_summary_TNL_CNL_RNL.tsv"),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Module = as.character(Module)
+  )
+
+type_de_matrix_df <- read_tsv(
+  analysis_file("NLR_type_DE_matrix_TNL_CNL_RNL.tsv"),
+  show_col_types = FALSE
+) %>%
+  mutate(Type = factor(Type, levels = tcr_levels)) %>%
+  arrange(Type)
+
+stdres_df <- read_tsv(
+  analysis_file("NLR_type_DE_standardized_residuals_TNL_CNL_RNL.tsv"),
+  show_col_types = FALSE
+) %>%
+  mutate(Type = factor(Type, levels = tcr_levels)) %>%
+  arrange(Type)
+
+
+## -----------------------------
+## 2. Overall Fisher test and pairwise Fisher tests
+## -----------------------------
+
+type_de_mat <- type_de_matrix_df %>%
+  column_to_rownames("Type") %>%
+  as.matrix()
+
+type_de_mat <- type_de_mat[, c("DE", "nonDE"), drop = FALSE]
+
+overall_fisher <- fisher.test(type_de_mat)
+
+cat("\n===== Overall Fisher test: TNL/CNL/RNL =====\n")
+print(type_de_mat)
+print(overall_fisher)
+
+capture.output(
+  overall_fisher,
+  file = file.path(outdir, "Fisher_test_overall_TNL_CNL_RNL.txt")
+)
+
+pairwise_fisher <- combn(tcr_levels, 2, simplify = FALSE) %>%
+  map_dfr(function(pair) {
+    
+    pair_mat_df <- type_de_matrix_df %>%
+      filter(Type %in% pair) %>%
+      mutate(Type = factor(Type, levels = pair)) %>%
+      arrange(Type)
+    
+    pair_mat <- pair_mat_df %>%
+      dplyr::select(DE, nonDE) %>%
+      as.matrix()
+    
+    rownames(pair_mat) <- as.character(pair_mat_df$Type)
+    
+    ft <- fisher.test(pair_mat)
+    
+    tibble(
+      comparison = paste(pair, collapse = "_vs_"),
+      type1 = pair[1],
+      type2 = pair[2],
+      type1_DE = pair_mat[pair[1], "DE"],
+      type1_nonDE = pair_mat[pair[1], "nonDE"],
+      type2_DE = pair_mat[pair[2], "DE"],
+      type2_nonDE = pair_mat[pair[2], "nonDE"],
+      odds_ratio = unname(ft$estimate),
+      pvalue = ft$p.value
+    )
+  }) %>%
+  mutate(
+    padj_BH = p.adjust(pvalue, method = "BH")
+  )
+
+cat("\n===== Pairwise Fisher tests =====\n")
+print(pairwise_fisher)
+
+write_tsv(
+  pairwise_fisher,
+  file.path(outdir, "Pairwise_Fisher_TNL_CNL_RNL.tsv")
+)
+
+
+## -----------------------------
+## 3. Figure 1: DE ratio by structural type
+## -----------------------------
+
+p_de_ratio <- type_de_summary %>%
+  mutate(
+    label = paste0(DE_NLR, "/", Tested_NLR),
+    DE_percent = DE_ratio * 100
+  ) %>%
+  ggplot(aes(x = Type, y = DE_ratio, fill = Type)) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.25) +
+  geom_text(
+    aes(label = label),
+    vjust = -0.5,
+    size = 4
+  ) +
+  scale_fill_manual(values = type_cols, drop = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, max(type_de_summary$DE_ratio, na.rm = TRUE) * 1.25)
+  ) +
+  labs(
+    title = "Proportion of time-responsive NLRs by structural class",
+    subtitle = paste0("Overall Fisher exact test: p = ", signif(overall_fisher$p.value, 3)),
+    x = "NLR structural class",
+    y = "DE NLR ratio"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_de_ratio)
+
+save_plot(
+  p_de_ratio,
+  "Fig1_TCR_DE_ratio",
+  width = 6,
+  height = 5
+)
+
+
+## -----------------------------
+## 4. Figure 2: DE / nonDE stacked bar
+## -----------------------------
+
+type_de_long <- type_de_matrix_df %>%
+  pivot_longer(
+    cols = c("DE", "nonDE"),
+    names_to = "DE_status",
+    values_to = "NLR_count"
+  ) %>%
+  mutate(
+    DE_status = factor(DE_status, levels = c("DE", "nonDE")),
+    Type = factor(Type, levels = tcr_levels)
+  ) %>%
+  group_by(Type) %>%
+  mutate(
+    Type_total = sum(NLR_count),
+    ratio = NLR_count / Type_total,
+    label = ifelse(NLR_count > 0, as.character(NLR_count), "")
+  ) %>%
+  ungroup()
+
+p_de_stacked <- ggplot(
+  type_de_long,
+  aes(x = Type, y = ratio, fill = DE_status)
+) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(
+    values = c(DE = "#D73027", nonDE = "#D9D9D9")
+  ) +
+  labs(
+    title = "DE and non-DE composition of tested NLRs",
+    x = "NLR structural class",
+    y = "Proportion of tested NLRs",
+    fill = "LRT status"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_de_stacked)
+
+save_plot(
+  p_de_stacked,
+  "Fig2_TCR_DE_nonDE_stacked",
+  width = 6,
+  height = 5
+)
+
+
+## -----------------------------
+## 5. Figure 3: Mfuzz cluster composition
+## -----------------------------
+
+cluster_order <- type_cluster_table %>%
+  pull(Cluster) %>%
+  unique()
+
+if (all(str_detect(cluster_order, "^\\d+$"))) {
+  cluster_order <- as.character(sort(as.numeric(cluster_order)))
+} else {
+  cluster_order <- sort(cluster_order)
+}
+
+type_cluster_plot <- type_cluster_table %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Cluster = factor(Cluster, levels = cluster_order),
+    label = ifelse(NLR_count > 0, as.character(NLR_count), "")
+  )
+
+missing_cluster_cols <- setdiff(levels(type_cluster_plot$Cluster), names(cluster_cols))
+if (length(missing_cluster_cols) > 0) {
+  extra_cols <- hue_pal()(length(missing_cluster_cols))
+  names(extra_cols) <- missing_cluster_cols
+  cluster_cols_use <- c(cluster_cols, extra_cols)
+} else {
+  cluster_cols_use <- cluster_cols
+}
+
+p_cluster_stacked <- ggplot(
+  type_cluster_plot,
+  aes(x = Type, y = Within_type_ratio, fill = Cluster)
+) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 3.8
+  ) +
+  scale_fill_manual(values = cluster_cols_use, drop = FALSE) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Mfuzz cluster composition of DE NLRs",
+    x = "NLR structural class",
+    y = "Proportion within structural class",
+    fill = "Mfuzz cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_cluster_stacked)
+
+save_plot(
+  p_cluster_stacked,
+  "Fig3_TCR_Mfuzz_cluster_composition",
+  width = 7,
+  height = 5
+)
+
+
+## -----------------------------
+## 6. Figure 4: Mfuzz cluster heatmap
+## -----------------------------
+
+p_cluster_heatmap <- ggplot(
+  type_cluster_plot,
+  aes(x = Cluster, y = Type, fill = Within_type_ratio)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(
+    aes(label = NLR_count),
+    size = 4
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#B2182B",
+    labels = percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Mfuzz cluster distribution of DE NLRs",
+    x = "Mfuzz cluster",
+    y = "NLR structural class",
+    fill = "Within-class ratio"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+print(p_cluster_heatmap)
+
+save_plot(
+  p_cluster_heatmap,
+  "Fig4_TCR_Mfuzz_cluster_heatmap",
+  width = 6.5,
+  height = 4.5
+)
+
+
+## -----------------------------
+## 7. Figure 5: WGCNA module heatmap, top modules
+## -----------------------------
+
+top_n_modules <- 15
+
+module_order <- type_module_table %>%
+  group_by(Module) %>%
+  summarise(Total_NLR_count = sum(NLR_count), .groups = "drop") %>%
+  arrange(desc(Total_NLR_count), Module) %>%
+  slice_head(n = top_n_modules) %>%
+  pull(Module)
+
+type_module_top <- type_module_table %>%
+  filter(Module %in% module_order) %>%
+  dplyr::select(Type, Module, NLR_count) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Module = factor(Module, levels = module_order)
+  ) %>%
+  complete(
+    Type = factor(tcr_levels, levels = tcr_levels),
+    Module = factor(module_order, levels = module_order),
+    fill = list(NLR_count = 0)
+  )
+
+p_module_heatmap <- ggplot(
+  type_module_top,
+  aes(x = Module, y = Type, fill = NLR_count)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(
+    aes(label = ifelse(NLR_count > 0, NLR_count, "")),
+    size = 3.8
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#2166AC"
+  ) +
+  labs(
+    title = paste0("Top ", top_n_modules, " WGCNA modules containing DE TNL/CNL/RNL genes"),
+    x = "WGCNA module",
+    y = "NLR structural class",
+    fill = "DE NLR count"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+print(p_module_heatmap)
+
+save_plot(
+  p_module_heatmap,
+  "Fig5_TCR_WGCNA_module_heatmap_top15",
+  width = 9,
+  height = 4.8
+)
+
+
+## -----------------------------
+## 8. Figure 6: WGCNA module stacked bar, top modules
+## -----------------------------
+
+type_module_stacked <- type_module_table %>%
+  filter(Module %in% module_order) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Module = factor(Module, levels = module_order)
+  ) %>%
+  group_by(Type) %>%
+  mutate(
+    top_module_total = sum(NLR_count),
+    ratio_among_top_modules = NLR_count / top_module_total,
+    label = ifelse(NLR_count > 0, as.character(NLR_count), "")
+  ) %>%
+  ungroup()
+
+module_cols <- setNames(
+  ifelse(module_order %in% colors(), module_order, "grey70"),
+  module_order
+)
+
+p_module_stacked <- ggplot(
+  type_module_stacked,
+  aes(x = Type, y = ratio_among_top_modules, fill = Module)
+) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 3.2
+  ) +
+  scale_fill_manual(values = module_cols, drop = FALSE) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = paste0("WGCNA module composition of DE NLRs, top ", top_n_modules, " modules"),
+    x = "NLR structural class",
+    y = "Proportion among top modules",
+    fill = "WGCNA module"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(p_module_stacked)
+
+save_plot(
+  p_module_stacked,
+  "Fig6_TCR_WGCNA_module_stacked_top15",
+  width = 8,
+  height = 5.5
+)
+
+
+## -----------------------------
+## 9. Figure 7: standardized residual heatmap
+## -----------------------------
+
+stdres_long <- stdres_df %>%
+  pivot_longer(
+    cols = c("DE", "nonDE"),
+    names_to = "DE_status",
+    values_to = "stdres"
+  ) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    DE_status = factor(DE_status, levels = c("DE", "nonDE")),
+    label = sprintf("%.2f", stdres)
+  )
+
+max_abs_res <- max(abs(stdres_long$stdres), na.rm = TRUE)
+
+p_stdres <- ggplot(
+  stdres_long,
+  aes(x = DE_status, y = Type, fill = stdres)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(
+    aes(label = label),
+    size = 4
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-max_abs_res, max_abs_res)
+  ) +
+  labs(
+    title = "Standardized residuals of structural class × DE status",
+    subtitle = "Positive residual: observed count higher than expected",
+    x = "LRT status",
+    y = "NLR structural class",
+    fill = "Std. residual"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+print(p_stdres)
+
+save_plot(
+  p_stdres,
+  "Fig7_TCR_DE_standardized_residuals",
+  width = 6.2,
+  height = 4.5
+)
+```
+```{r}
+## -----------------------------
+## 10. Export concise text summary
+## -----------------------------
+
+type_de_summary_clean <- type_de_summary %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = as.character(Type),
+    Total_NLR = as.numeric(Total_NLR),
+    Tested_NLR = as.numeric(Tested_NLR),
+    DE_NLR = as.numeric(DE_NLR),
+    DE_ratio = as.numeric(DE_ratio)
+  )
+
+type_cluster_table_clean <- type_cluster_table %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = as.character(Type),
+    Cluster = as.character(Cluster),
+    NLR_count = as.numeric(NLR_count),
+    Within_type_ratio = as.numeric(Within_type_ratio)
+  )
+
+type_module_table_clean <- type_module_table %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = as.character(Type),
+    Module = as.character(Module),
+    NLR_count = as.numeric(NLR_count)
+  )
+
+stdres_df_clean <- stdres_df %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = as.character(Type),
+    DE = as.numeric(DE),
+    nonDE = as.numeric(nonDE)
+  )
+
+
+highest_de_type <- type_de_summary_clean %>%
+  arrange(desc(DE_ratio)) %>%
+  dplyr::slice_head(n = 1)
+
+lowest_de_type <- type_de_summary_clean %>%
+  arrange(DE_ratio) %>%
+  dplyr::slice_head(n = 1)
+
+
+dominant_clusters <- type_cluster_table_clean %>%
+  group_by(Type) %>%
+  arrange(desc(Within_type_ratio), .by_group = TRUE) %>%
+  dplyr::slice_head(n = 1) %>%
+  ungroup()
+
+
+dominant_modules <- type_module_table_clean %>%
+  group_by(Type) %>%
+  arrange(desc(NLR_count), .by_group = TRUE) %>%
+  dplyr::slice_head(n = 1) %>%
+  ungroup()
+
+
+summary_file <- file.path(outdir, "TCR_structure_analysis_summary.txt")
+
+sink(summary_file)
+
+cat("TNL/CNL/RNL structural-class analysis summary\n")
+cat("================================================\n\n")
+
+cat("1. DE ratio by structural class\n")
+print(type_de_summary_clean)
+cat("\n")
+
+cat("2. Overall Fisher exact test\n")
+print(overall_fisher)
+cat("\n")
+
+cat("3. Pairwise Fisher exact tests\n")
+print(pairwise_fisher)
+cat("\n")
+
+cat("4. Standardized residuals\n")
+print(stdres_df_clean)
+cat("\n")
+
+cat("5. Highest and lowest DE ratio\n")
+cat(
+  "Highest DE ratio:",
+  highest_de_type$Type,
+  "with",
+  highest_de_type$DE_NLR,
+  "/",
+  highest_de_type$Tested_NLR,
+  "DE NLRs; ratio =",
+  round(highest_de_type$DE_ratio, 4),
+  "\n"
+)
+
+cat(
+  "Lowest DE ratio:",
+  lowest_de_type$Type,
+  "with",
+  lowest_de_type$DE_NLR,
+  "/",
+  lowest_de_type$Tested_NLR,
+  "DE NLRs; ratio =",
+  round(lowest_de_type$DE_ratio, 4),
+  "\n\n"
+)
+
+cat("6. Dominant Mfuzz cluster by structural class\n")
+print(dominant_clusters)
+cat("\n")
+
+cat("7. Dominant WGCNA module by structural class\n")
+print(dominant_modules)
+cat("\n")
+
+sink()
+
+cat("\nSummary file generated:\n")
+cat(summary_file, "\n")
+
+
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(type_de_summary, n = 20, title = "DE ratio summary used in figures")
+show_table(pairwise_fisher, n = 20, title = "Pairwise Fisher tests")
+show_table(dominant_clusters, n = 20, title = "Dominant Mfuzz cluster by structural class")
+show_table(dominant_modules, n = 20, title = "Dominant WGCNA module by structural class")
+```

@@ -1,0 +1,1680 @@
+---
+title: "NLR Centered Coexpression Network"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+load_rds_list("03_vst_expression")
+load_rds_list("05_wgcna_soft_threshold")
+load_rds_list("06_wgcna_network")
+load_rds_list("07_annotation_background")
+gene_module_df <- load_rds_object("06_gene_module_df")
+```
+
+```{r}
+############################################################
+## Step 5. NLR-centered co-expression network analysis
+##
+## Purpose:
+##   Build NLR-centered co-expression networks from prioritized WGCNA modules.
+##   This is NOT a causal regulatory network.
+##   It is a co-expression candidate network centered on DE TNL/CNL/RNL genes.
+##
+## Main inputs:
+##   1. WGCNA_TCR_NLR_module_enrichment/WGCNA_module_TCR_NLR_enrichment.tsv
+##   2. gene_module_df OR moduleColors + wgcna_data
+##   3. wgcna_data OR expr_matrix
+##   4. log2FC_threshold_sensitivity_TNL_CNL_RNL/NLR_TCR_LRT_Wald_log2FC_sensitivity.tsv
+##
+## Main outputs:
+##   NLR_centered_coexpression_network/
+##     Cytoscape_NLR_centered_edges.tsv
+##     Cytoscape_NLR_centered_nodes.tsv
+##     NLR_seed_hub_ranking.tsv
+##     Module_network_summary.tsv
+##     per_module_networks/
+##     figures
+############################################################
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+
+## -----------------------------
+## 0. Settings
+## -----------------------------
+
+outdir <- analysis_file("NLR_centered_coexpression_network")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+module_outdir <- file.path(outdir, "per_module_networks")
+dir.create(module_outdir, showWarnings = FALSE, recursive = TRUE)
+
+fig_outdir <- file.path(outdir, "figures")
+dir.create(fig_outdir, showWarnings = FALSE, recursive = TRUE)
+
+tcr_levels <- c("TNL", "CNL", "RNL")
+
+min_abs_cor <- 0.80
+max_pvalue <- 0.05
+top_n_targets_per_NLR <- 50
+
+top_n_network_modules <- 8
+
+min_DE_TCR_NLR_for_network <- 2
+
+include_previous_focus_modules <- FALSE
+previous_focus_modules <- c("red", "blue", "turquoise")
+
+manual_modules_to_include <- c("red")
+
+soft_power_for_weight <- if (exists("softPower")) {
+  softPower
+} else if (exists("power")) {
+  power
+} else {
+  4
+}
+
+cat("Using soft power for approximate edge weight:", soft_power_for_weight, "\n")
+
+type_cols <- c(
+  TNL = "#7B3294",
+  CNL = "#008837",
+  RNL = "#E66101"
+)
+
+node_class_cols <- c(
+  Seed_DE_NLR = "#B2182B",
+  Other_TCR_NLR = "#EF8A62",
+  Coexpressed_gene = "#9E9E9E"
+)
+
+save_plot <- function(plot_obj, filename, width = 7, height = 5) {
+  ggsave(
+    filename = file.path(fig_outdir, paste0(filename, ".pdf")),
+    plot = plot_obj,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    filename = file.path(fig_outdir, paste0(filename, ".png")),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+as_logical_safe <- function(x) {
+  if (is.logical(x)) return(x)
+  
+  x_chr <- toupper(trimws(as.character(x)))
+  
+  dplyr::case_when(
+    x_chr %in% c("TRUE", "T", "1", "YES", "Y") ~ TRUE,
+    x_chr %in% c("FALSE", "F", "0", "NO", "N") ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+safe_name <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace_all("[^A-Za-z0-9_.-]+", "_")
+}
+
+empty_edges_tbl <- function() {
+  tibble(
+    Source = character(),
+    Target = character(),
+    Module = character(),
+    Correlation = numeric(),
+    abs_cor = numeric(),
+    pvalue = numeric(),
+    padj_BH = numeric(),
+    Direction = character(),
+    EdgeType = character(),
+    SourceType = character(),
+    TargetType = character(),
+    SourceIsSeedNLR = logical(),
+    TargetIsNLR = logical(),
+    AdjacencyApprox = numeric(),
+    SourceModule = character(),
+    TargetModule = character()
+  )
+}
+
+
+## -----------------------------
+## 1. Read WGCNA module enrichment result
+## -----------------------------
+
+module_enrichment_file <- analysis_file("WGCNA_TCR_NLR_module_enrichment", "WGCNA_module_TCR_NLR_enrichment.tsv")
+
+if (!file.exists(module_enrichment_file)) {
+  stop(
+    "Cannot find WGCNA module enrichment file: ",
+    module_enrichment_file,
+    "\nPlease run the WGCNA module re-ranking step first."
+  )
+}
+
+module_enrichment <- read_tsv(
+  module_enrichment_file,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Module = as.character(Module)
+  ) %>%
+  arrange(
+    FDR_DE_TCR,
+    desc(FoldEnrichment_DE_TCR),
+    desc(DE_TCR_density),
+    desc(DE_TCR_NLR),
+    ModuleSize
+  )
+
+cat("\n===== Top enriched WGCNA modules =====\n")
+print(
+  module_enrichment %>%
+    dplyr::select(
+      Rank_DE_TCR_enrichment,
+      Module,
+      ModuleSize,
+      DE_TCR_NLR,
+      DE_TCR_density,
+      FoldEnrichment_DE_TCR,
+      p_over_DE_TCR,
+      FDR_DE_TCR,
+      Priority
+    ) %>%
+    dplyr::slice_head(n = 20)
+)
+
+
+## -----------------------------
+## 2. Prepare gene_module_df
+## -----------------------------
+
+if (!exists("gene_module_df")) {
+  
+  if (exists("moduleColors") && exists("wgcna_data")) {
+    
+    gene_module_df <- tibble(
+      Gene = colnames(wgcna_data),
+      Module = as.character(moduleColors)
+    )
+    
+    message("gene_module_df was created from moduleColors and colnames(wgcna_data).")
+    
+  } else {
+    
+    stop(
+      "Cannot find gene_module_df. Please provide gene_module_df with columns Gene and Module, ",
+      "or provide moduleColors + wgcna_data."
+    )
+  }
+}
+
+gene_module_df_clean <- as.data.frame(gene_module_df) %>%
+  as_tibble()
+
+if (!"Gene" %in% colnames(gene_module_df_clean)) {
+  colnames(gene_module_df_clean)[1] <- "Gene"
+}
+
+if (!"Module" %in% colnames(gene_module_df_clean)) {
+  
+  possible_module_cols <- c(
+    "module", "ModuleColor", "moduleColor",
+    "colors", "moduleColors"
+  )
+  
+  matched_module_col <- intersect(possible_module_cols, colnames(gene_module_df_clean))
+  
+  if (length(matched_module_col) >= 1) {
+    gene_module_df_clean <- gene_module_df_clean %>%
+      dplyr::rename(Module = all_of(matched_module_col[1]))
+  } else {
+    colnames(gene_module_df_clean)[2] <- "Module"
+  }
+}
+
+gene_module_df_clean <- gene_module_df_clean %>%
+  mutate(
+    Gene = as.character(Gene) %>% str_trim(),
+    Module = as.character(Module) %>% str_trim()
+  ) %>%
+  filter(!is.na(Gene), Gene != "", !is.na(Module), Module != "") %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  dplyr::select(Gene, Module)
+
+cat("\n===== gene_module_df check =====\n")
+cat("WGCNA genes:", nrow(gene_module_df_clean), "\n")
+cat("WGCNA modules:", n_distinct(gene_module_df_clean$Module), "\n")
+
+
+## -----------------------------
+## 3. Prepare expression matrix as datExpr
+##    Required orientation: samples × genes
+## -----------------------------
+
+if (exists("wgcna_data")) {
+  
+  datExpr_raw <- wgcna_data
+  message("Using object 'wgcna_data' as expression input.")
+  
+} else if (exists("datExpr")) {
+  
+  datExpr_raw <- datExpr
+  message("Using object 'datExpr' as expression input.")
+  
+} else if (exists("expr_matrix")) {
+  
+  datExpr_raw <- expr_matrix
+  message("Using object 'expr_matrix' as expression input.")
+  
+} else {
+  
+  stop(
+    "Cannot find expression data. Please provide one of: wgcna_data, datExpr, or expr_matrix."
+  )
+}
+
+datExpr_raw <- as.data.frame(datExpr_raw)
+
+gene_overlap_cols <- sum(colnames(datExpr_raw) %in% gene_module_df_clean$Gene)
+gene_overlap_rows <- sum(rownames(datExpr_raw) %in% gene_module_df_clean$Gene)
+
+cat("\nGene overlap with expression matrix:\n")
+cat("Overlap with columns:", gene_overlap_cols, "\n")
+cat("Overlap with rows:", gene_overlap_rows, "\n")
+
+if (gene_overlap_rows > gene_overlap_cols) {
+  datExpr <- as.data.frame(t(as.matrix(datExpr_raw)))
+  message("Expression matrix was transposed to samples × genes.")
+} else {
+  datExpr <- datExpr_raw
+  message("Expression matrix is treated as samples × genes.")
+}
+
+common_expr_genes <- intersect(colnames(datExpr), gene_module_df_clean$Gene)
+
+if (length(common_expr_genes) == 0) {
+  stop("No overlapping genes between expression matrix columns and WGCNA gene_module_df.")
+}
+
+datExpr <- datExpr[, common_expr_genes, drop = FALSE]
+
+datExpr <- as.data.frame(datExpr)
+datExpr[] <- lapply(datExpr, function(x) as.numeric(as.character(x)))
+
+keep_gene_cols <- sapply(datExpr, function(x) {
+  sum(!is.na(x)) >= 3 && sd(x, na.rm = TRUE) > 0
+})
+
+datExpr <- datExpr[, keep_gene_cols, drop = FALSE]
+
+cat("\n===== datExpr check =====\n")
+cat("Samples:", nrow(datExpr), "\n")
+cat("Genes:", ncol(datExpr), "\n")
+
+
+## -----------------------------
+## 4. Read TNL/CNL/RNL master table
+## -----------------------------
+
+candidate_master_files <- c(
+  analysis_file("log2FC_threshold_sensitivity_TNL_CNL_RNL", "NLR_TCR_LRT_Wald_log2FC_sensitivity.tsv"),
+  "NLR_TCR_LRT_Wald_log2FC_sensitivity.tsv",
+  analysis_file("NLR_master_TNL_CNL_RNL.tsv")
+)
+
+existing_master_files <- candidate_master_files[file.exists(candidate_master_files)]
+
+if (length(existing_master_files) >= 1) {
+  
+  nlr_master_file <- existing_master_files[1]
+  
+  nlr_master <- read_tsv(
+    nlr_master_file,
+    show_col_types = FALSE
+  )
+  
+  message("Using NLR master file: ", nlr_master_file)
+  
+} else if (exists("nlr_master")) {
+  
+  nlr_master <- as.data.frame(nlr_master) %>%
+    as_tibble()
+  
+  message("Using object 'nlr_master' from current R environment.")
+  
+} else {
+  
+  stop(
+    "Cannot find NLR master table. Please provide one of:\n",
+    paste(candidate_master_files, collapse = "\n")
+  )
+}
+
+if (!"Gene" %in% colnames(nlr_master)) {
+  colnames(nlr_master)[1] <- "Gene"
+}
+
+if (!"Type" %in% colnames(nlr_master)) {
+  stop("NLR master table must contain a column named Type.")
+}
+
+nlr_master <- nlr_master %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Gene = as.character(Gene) %>% str_trim(),
+    Type = as.character(Type) %>% str_trim() %>% str_to_upper()
+  ) %>%
+  filter(Type %in% tcr_levels) %>%
+  dplyr::select(-any_of("Module")) %>%
+  left_join(gene_module_df_clean, by = "Gene") %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels)
+  )
+
+if ("DE_LRT" %in% colnames(nlr_master)) {
+  nlr_master <- nlr_master %>%
+    mutate(DE_LRT = as_logical_safe(DE_LRT))
+} else if ("padj" %in% colnames(nlr_master)) {
+  nlr_master <- nlr_master %>%
+    mutate(
+      DE_LRT = case_when(
+        !is.na(padj) & padj < 0.05 ~ TRUE,
+        !is.na(padj) & padj >= 0.05 ~ FALSE,
+        TRUE ~ NA
+      )
+    )
+} else {
+  stop("NLR master table must contain either DE_LRT or padj.")
+}
+
+cat("\n===== TNL/CNL/RNL NLR check =====\n")
+print(
+  nlr_master %>%
+    group_by(Type) %>%
+    summarise(
+      Total_NLR = n(),
+      In_WGCNA = sum(!is.na(Module)),
+      In_expression = sum(Gene %in% colnames(datExpr)),
+      DE_LRT = sum(DE_LRT == TRUE, na.rm = TRUE),
+      DE_LRT_in_expression = sum(DE_LRT == TRUE & Gene %in% colnames(datExpr), na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+
+## -----------------------------
+## 5. Choose modules for network analysis
+## -----------------------------
+
+auto_modules <- module_enrichment %>%
+  filter(DE_TCR_NLR >= min_DE_TCR_NLR_for_network) %>%
+  arrange(
+    FDR_DE_TCR,
+    desc(FoldEnrichment_DE_TCR),
+    desc(DE_TCR_density),
+    desc(DE_TCR_NLR),
+    ModuleSize
+  ) %>%
+  dplyr::slice_head(n = top_n_network_modules) %>%
+  pull(Module)
+
+modules_to_network <- unique(c(manual_modules_to_include, auto_modules))
+
+if (include_previous_focus_modules) {
+  modules_to_network <- unique(c(modules_to_network, previous_focus_modules))
+}
+
+modules_to_network <- modules_to_network[
+  modules_to_network %in% gene_module_df_clean$Module
+]
+
+if (length(modules_to_network) == 0) {
+  stop("No modules were selected for network analysis.")
+}
+
+write_lines(
+  modules_to_network,
+  file.path(outdir, "Modules_selected_for_NLR_centered_network.txt")
+)
+
+cat("\n===== Modules selected for NLR-centered network =====\n")
+print(
+  module_enrichment %>%
+    filter(Module %in% modules_to_network) %>%
+    dplyr::select(
+      Rank_DE_TCR_enrichment,
+      Module,
+      ModuleSize,
+      DE_TCR_NLR,
+      DE_TCR_density,
+      FoldEnrichment_DE_TCR,
+      FDR_DE_TCR,
+      Priority
+    ) %>%
+    arrange(match(Module, modules_to_network))
+)
+
+
+## -----------------------------
+## 6. Optional functional annotation
+## -----------------------------
+
+anno_df <- NULL
+
+if (exists("anno")) {
+  
+  anno_df <- as.data.frame(anno) %>%
+    as_tibble()
+  
+  if (!"Gene" %in% colnames(anno_df)) {
+    colnames(anno_df)[1] <- "Gene"
+  }
+  
+  anno_df <- anno_df %>%
+    mutate(Gene = as.character(Gene) %>% str_trim()) %>%
+    distinct(Gene, .keep_all = TRUE)
+  
+  message("Using object 'anno' for node annotation.")
+  
+} else {
+  
+  candidate_anno_files <- c(
+    "annotation.tsv",
+    "annotations.tsv",
+    "eggnog_annotation.tsv",
+    "eggnog_annotations.tsv",
+    "eggnog.emapper.annotations"
+  )
+  
+  existing_anno_files <- candidate_anno_files[file.exists(candidate_anno_files)]
+  
+  if (length(existing_anno_files) >= 1) {
+    
+    anno_file <- existing_anno_files[1]
+    
+    anno_df <- read_tsv(
+      anno_file,
+      comment = "#",
+      show_col_types = FALSE
+    )
+    
+    if (!"Gene" %in% colnames(anno_df)) {
+      colnames(anno_df)[1] <- "Gene"
+    }
+    
+    anno_df <- anno_df %>%
+      mutate(Gene = as.character(Gene) %>% str_trim()) %>%
+      distinct(Gene, .keep_all = TRUE)
+    
+    message("Using annotation file: ", anno_file)
+  }
+}
+
+if (!is.null(anno_df)) {
+  
+  anno_keep_cols <- c(
+    "Gene",
+    "Preferred_name",
+    "Description",
+    "KEGG_Pathway",
+    "KEGG_ko",
+    "GOs",
+    "PFAMs",
+    "COG_category"
+  )
+  
+  anno_df <- anno_df %>%
+    dplyr::select(any_of(anno_keep_cols))
+  
+} else {
+  message("No annotation table found. Node annotation will only contain network and NLR metadata.")
+}
+
+
+## -----------------------------
+## 7. Function: calculate module eigengene and kME
+## -----------------------------
+
+calculate_module_kME <- function(mod, genes_in_module) {
+  
+  genes_in_module <- intersect(genes_in_module, colnames(datExpr))
+  
+  if (length(genes_in_module) == 0) {
+    return(tibble())
+  }
+  
+  mat <- datExpr[, genes_in_module, drop = FALSE]
+  
+  keep <- sapply(mat, function(x) sd(x, na.rm = TRUE) > 0)
+  mat <- mat[, keep, drop = FALSE]
+  
+  if (ncol(mat) == 0) {
+    return(tibble())
+  }
+  
+  if (ncol(mat) == 1) {
+    
+    ME <- as.numeric(scale(mat[, 1]))
+    names(ME) <- rownames(mat)
+    
+  } else {
+    
+    mat_scaled <- scale(mat)
+    mat_scaled[is.na(mat_scaled)] <- 0
+    
+    pc <- prcomp(
+      mat_scaled,
+      center = FALSE,
+      scale. = FALSE
+    )
+    
+    ME <- pc$x[, 1]
+  }
+  
+  kME <- sapply(
+    colnames(mat),
+    function(g) {
+      suppressWarnings(
+        cor(
+          datExpr[, g],
+          ME,
+          use = "pairwise.complete.obs",
+          method = "pearson"
+        )
+      )
+    }
+  )
+  
+  tibble(
+    Gene = names(kME),
+    Module = mod,
+    kME = as.numeric(kME),
+    abs_kME = abs(as.numeric(kME))
+  )
+}
+
+
+## -----------------------------
+## 8. Function: build NLR-centered network for one module
+## -----------------------------
+
+build_nlr_centered_network <- function(mod) {
+  
+  cat("\nBuilding network for module:", mod, "\n")
+  
+  mod_genes <- gene_module_df_clean %>%
+    filter(Module == mod) %>%
+    pull(Gene) %>%
+    unique()
+  
+  mod_genes <- intersect(mod_genes, colnames(datExpr))
+  
+  if (length(mod_genes) < 2) {
+    message("Module ", mod, " has fewer than 2 expressed genes. Skipped.")
+    return(empty_edges_tbl())
+  }
+  
+  seed_nlrs <- nlr_master %>%
+    filter(
+      Module == mod,
+      DE_LRT == TRUE,
+      Type %in% tcr_levels,
+      Gene %in% mod_genes
+    ) %>%
+    pull(Gene) %>%
+    unique()
+  
+  if (length(seed_nlrs) == 0) {
+    message("Module ", mod, " has no expressed DE TNL/CNL/RNL seed genes. Skipped.")
+    return(empty_edges_tbl())
+  }
+  
+  cat("Module genes:", length(mod_genes), "\n")
+  cat("Seed DE TCR NLRs:", length(seed_nlrs), "\n")
+  
+  seed_mat <- datExpr[, seed_nlrs, drop = FALSE]
+  target_mat <- datExpr[, mod_genes, drop = FALSE]
+  
+  cor_mat <- tryCatch(
+    {
+      WGCNA::bicor(
+        seed_mat,
+        target_mat,
+        use = "pairwise.complete.obs",
+        maxPOutliers = 0.1
+      )
+    },
+    error = function(e) {
+      message("bicor failed for module ", mod, ". Using Pearson correlation instead.")
+      cor(
+        seed_mat,
+        target_mat,
+        use = "pairwise.complete.obs",
+        method = "pearson"
+      )
+    }
+  )
+  
+  cor_mat <- as.matrix(cor_mat)
+  
+  if (is.null(rownames(cor_mat))) {
+    rownames(cor_mat) <- seed_nlrs
+  }
+  
+  if (is.null(colnames(cor_mat))) {
+    colnames(cor_mat) <- mod_genes
+  }
+  
+  p_mat <- WGCNA::corPvalueStudent(
+    cor_mat,
+    nSamples = nrow(datExpr)
+  )
+  
+## Build edge table from the correlation matrix
+## 
+edges_raw <- expand.grid(
+  Source = rownames(cor_mat),
+  Target = colnames(cor_mat),
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  mutate(
+    Source = as.character(Source),
+    Target = as.character(Target),
+    Correlation = as.numeric(as.vector(cor_mat)),
+    pvalue = as.numeric(as.vector(p_mat)),
+    Module = as.character(mod),
+    abs_cor = abs(Correlation)
+  ) %>%
+  filter(Source != Target)
+  
+  if (nrow(edges_raw) == 0) {
+    return(empty_edges_tbl())
+  }
+  
+  edges_filtered <- edges_raw %>%
+    filter(
+      !is.na(Correlation),
+      !is.na(pvalue),
+      abs_cor >= min_abs_cor,
+      pvalue <= max_pvalue
+    ) %>%
+    group_by(Source) %>%
+    arrange(desc(abs_cor), pvalue, .by_group = TRUE) %>%
+    dplyr::slice_head(n = top_n_targets_per_NLR) %>%
+    ungroup() %>%
+    mutate(
+      padj_BH = p.adjust(pvalue, method = "BH"),
+      Direction = if_else(Correlation >= 0, "positive", "negative"),
+      SourceIsSeedNLR = TRUE,
+      TargetIsNLR = Target %in% nlr_master$Gene,
+      AdjacencyApprox = abs_cor ^ soft_power_for_weight,
+      SourceModule = mod,
+      TargetModule = mod
+    )
+  
+  if (nrow(edges_filtered) == 0) {
+    message(
+      "No edges passed thresholds in module ",
+      mod,
+      ". Consider lowering min_abs_cor from ",
+      min_abs_cor,
+      " to 0.75."
+    )
+    return(empty_edges_tbl())
+  }
+  
+  type_lookup <- nlr_master %>%
+    dplyr::select(Gene, Type) %>%
+    distinct(Gene, .keep_all = TRUE)
+  
+  source_type <- type_lookup$Type[match(edges_filtered$Source, type_lookup$Gene)]
+  target_type <- type_lookup$Type[match(edges_filtered$Target, type_lookup$Gene)]
+  
+  edges_filtered <- edges_filtered %>%
+    mutate(
+      SourceType = as.character(source_type),
+      TargetType = as.character(target_type),
+      TargetType = replace_na(TargetType, "non_NLR"),
+      EdgeType = case_when(
+        TargetIsNLR ~ "NLR_to_NLR",
+        TRUE ~ "NLR_to_coexpressed_gene"
+      )
+    ) %>%
+    dplyr::select(
+      Source,
+      Target,
+      Module,
+      Correlation,
+      abs_cor,
+      pvalue,
+      padj_BH,
+      Direction,
+      EdgeType,
+      SourceType,
+      TargetType,
+      SourceIsSeedNLR,
+      TargetIsNLR,
+      AdjacencyApprox,
+      SourceModule,
+      TargetModule
+    ) %>%
+    arrange(Module, Source, desc(abs_cor))
+  
+  return(edges_filtered)
+}
+
+
+## -----------------------------
+## 9. Build networks for selected modules
+## -----------------------------
+
+network_edges <- purrr::map_dfr(
+  modules_to_network,
+  build_nlr_centered_network
+)
+
+if (nrow(network_edges) == 0) {
+  stop(
+    "No network edges were generated. ",
+    "Try lowering min_abs_cor to 0.75 or increasing top_n_targets_per_NLR."
+  )
+}
+
+write_tsv(
+  network_edges,
+  file.path(outdir, "Cytoscape_NLR_centered_edges.tsv")
+)
+
+cat("\n===== Network edges generated =====\n")
+cat("Total edges:", nrow(network_edges), "\n")
+## 10. Build node table
+## -----------------------------
+
+network_genes <- unique(c(network_edges$Source, network_edges$Target))
+seed_genes <- unique(network_edges$Source)
+
+nlr_node_anno <- nlr_master %>%
+  dplyr::select(
+    any_of(c(
+      "Gene",
+      "Type",
+      "RawClass",
+      "baseMean",
+      "stat",
+      "pvalue",
+      "padj",
+      "DE_LRT",
+      "Cluster",
+      "max_abs_log2FC",
+      "log2FC_at_max",
+      "main_response_time",
+      "direction_at_max",
+      "response_strength",
+      "Wald_sig_timepoints"
+    ))
+  ) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+nodes <- tibble(Gene = network_genes) %>%
+  left_join(gene_module_df_clean, by = "Gene") %>%
+  left_join(nlr_node_anno, by = "Gene") %>%
+  mutate(
+    IsSeedNLR = Gene %in% seed_genes,
+    IsTCR_NLR = Gene %in% nlr_master$Gene,
+    IsDE_TCR_NLR = Gene %in% nlr_master$Gene[nlr_master$DE_LRT == TRUE],
+    Type = as.character(Type),
+    Type = replace_na(Type, "non_NLR"),
+    NodeClass = case_when(
+      IsSeedNLR ~ "Seed_DE_NLR",
+      IsTCR_NLR ~ "Other_TCR_NLR",
+      TRUE ~ "Coexpressed_gene"
+    )
+  )
+
+## -----------------------------
+## Degree and weighted degree
+## -----------------------------
+
+degree_source <- network_edges %>%
+  dplyr::mutate(Source_tmp = as.character(.data[["Source"]])) %>%
+  dplyr::group_by(Source_tmp) %>%
+  dplyr::summarise(
+    OutDegree = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(Gene = Source_tmp)
+
+degree_target <- network_edges %>%
+  dplyr::mutate(Target_tmp = as.character(.data[["Target"]])) %>%
+  dplyr::group_by(Target_tmp) %>%
+  dplyr::summarise(
+    InDegree = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(Gene = Target_tmp)
+
+weighted_degree <- dplyr::bind_rows(
+  network_edges %>%
+    dplyr::transmute(
+      Gene = as.character(.data[["Source"]]),
+      weight = as.numeric(.data[["abs_cor"]])
+    ),
+  network_edges %>%
+    dplyr::transmute(
+      Gene = as.character(.data[["Target"]]),
+      weight = as.numeric(.data[["abs_cor"]])
+    )
+) %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(
+    WeightedDegree = sum(weight, na.rm = TRUE),
+    MeanAbsCor = mean(weight, na.rm = TRUE),
+    MaxAbsCor = max(weight, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\n===== degree table check =====\n")
+print(head(degree_source))
+print(head(degree_target))
+print(head(weighted_degree))
+
+
+nodes <- nodes %>%
+  left_join(degree_source, by = "Gene") %>%
+  left_join(degree_target, by = "Gene") %>%
+  left_join(weighted_degree, by = "Gene") %>%
+  mutate(
+    OutDegree = replace_na(OutDegree, 0L),
+    InDegree = replace_na(InDegree, 0L),
+    Degree = OutDegree + InDegree,
+    WeightedDegree = replace_na(WeightedDegree, 0),
+    MeanAbsCor = replace_na(MeanAbsCor, 0),
+    MaxAbsCor = replace_na(MaxAbsCor, 0)
+  )
+
+# kME for network genes
+kME_df <- purrr::map_dfr(
+  unique(nodes$Module),
+  function(mod) {
+    if (is.na(mod)) return(tibble())
+    genes_mod <- nodes %>%
+      filter(Module == mod) %>%
+      pull(Gene)
+    calculate_module_kME(mod, genes_mod)
+  }
+)
+
+nodes <- nodes %>%
+  left_join(kME_df, by = c("Gene", "Module"))
+
+# optional functional annotation
+if (!is.null(anno_df)) {
+  nodes <- nodes %>%
+    left_join(anno_df, by = "Gene")
+}
+
+nodes <- nodes %>%
+  arrange(
+    factor(NodeClass, levels = c("Seed_DE_NLR", "Other_TCR_NLR", "Coexpressed_gene")),
+    Module,
+    desc(Degree),
+    Gene
+  )
+
+write_tsv(
+  nodes,
+  file.path(outdir, "Cytoscape_NLR_centered_nodes.tsv")
+)
+
+
+## -----------------------------
+## 11. Export per-module edge and node tables
+## -----------------------------
+
+for (mod in unique(network_edges$Module)) {
+  
+  mod_safe <- safe_name(mod)
+  
+  mod_edges <- network_edges %>%
+    filter(Module == mod)
+  
+  mod_nodes <- nodes %>%
+    filter(Gene %in% unique(c(mod_edges$Source, mod_edges$Target)))
+  
+  write_tsv(
+    mod_edges,
+    file.path(module_outdir, paste0("Module_", mod_safe, "_edges.tsv"))
+  )
+  
+  write_tsv(
+    mod_nodes,
+    file.path(module_outdir, paste0("Module_", mod_safe, "_nodes.tsv"))
+  )
+}
+
+
+## -----------------------------
+## 12. NLR seed hub ranking
+## -----------------------------
+
+nlr_seed_hub_ranking <- nodes %>%
+  filter(IsSeedNLR) %>%
+  arrange(
+    desc(Degree),
+    desc(WeightedDegree),
+    desc(abs_kME),
+    desc(max_abs_log2FC)
+  ) %>%
+  mutate(
+    HubRank = row_number()
+  ) %>%
+  dplyr::select(
+    HubRank,
+    Gene,
+    Type,
+    Module,
+    Degree,
+    OutDegree,
+    InDegree,
+    WeightedDegree,
+    MeanAbsCor,
+    MaxAbsCor,
+    kME,
+    abs_kME,
+    Cluster,
+    padj,
+    max_abs_log2FC,
+    log2FC_at_max,
+    main_response_time,
+    direction_at_max,
+    response_strength,
+    everything()
+  )
+
+write_tsv(
+  nlr_seed_hub_ranking,
+  file.path(outdir, "NLR_seed_hub_ranking.tsv")
+)
+
+cat("\n===== Top NLR seed hubs =====\n")
+print(
+  nlr_seed_hub_ranking %>%
+    dplyr::select(
+      HubRank,
+      Gene,
+      Type,
+      Module,
+      Degree,
+      WeightedDegree,
+      abs_kME,
+      max_abs_log2FC,
+      main_response_time,
+      direction_at_max
+    ) %>%
+    dplyr::slice_head(n = 20)
+)
+
+
+## -----------------------------
+## 13. Top coexpressed targets for each NLR
+## -----------------------------
+
+top_targets_by_NLR <- network_edges %>%
+  group_by(Source) %>%
+  arrange(desc(abs_cor), pvalue, .by_group = TRUE) %>%
+  dplyr::slice_head(n = 20) %>%
+  ungroup() %>%
+  left_join(
+    nodes %>%
+      dplyr::select(
+        Gene,
+        TargetNodeClass = NodeClass,
+        TargetType = Type,
+        TargetDegree = Degree,
+        Target_kME = kME,
+        any_of(c("Preferred_name", "Description", "KEGG_Pathway", "GOs"))
+      ),
+    by = c("Target" = "Gene")
+  ) %>%
+  arrange(Module, Source, desc(abs_cor))
+
+write_tsv(
+  top_targets_by_NLR,
+  file.path(outdir, "Top_coexpressed_targets_by_NLR.tsv")
+)
+
+
+## -----------------------------
+## 14. Module-level network summary
+## -----------------------------
+
+module_network_summary <- network_edges %>%
+  group_by(Module) %>%
+  summarise(
+    Edges = n(),
+    Positive_edges = sum(Direction == "positive"),
+    Negative_edges = sum(Direction == "negative"),
+    Seed_NLRs = n_distinct(Source),
+    Target_genes = n_distinct(Target),
+    Total_nodes = n_distinct(c(Source, Target)),
+    NLR_targets = sum(TargetIsNLR),
+    Mean_abs_cor = mean(abs_cor, na.rm = TRUE),
+    Median_abs_cor = median(abs_cor, na.rm = TRUE),
+    Max_abs_cor = max(abs_cor, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    module_enrichment %>%
+      dplyr::select(
+        Module,
+        Rank_DE_TCR_enrichment,
+        ModuleSize,
+        DE_TCR_NLR,
+        DE_TCR_density,
+        FoldEnrichment_DE_TCR,
+        FDR_DE_TCR,
+        Priority
+      ),
+    by = "Module"
+  ) %>%
+  arrange(
+    Rank_DE_TCR_enrichment,
+    desc(Edges)
+  )
+
+write_tsv(
+  module_network_summary,
+  file.path(outdir, "Module_network_summary.tsv")
+)
+
+cat("\n===== Module network summary =====\n")
+print(module_network_summary)
+
+
+## -----------------------------
+## 15. Optional: candidate non-NLR hub targets
+## -----------------------------
+
+candidate_nonNLR_hubs <- nodes %>%
+  filter(NodeClass == "Coexpressed_gene") %>%
+  arrange(desc(Degree), desc(WeightedDegree), desc(abs_kME)) %>%
+  mutate(TargetHubRank = row_number()) %>%
+  dplyr::select(
+    TargetHubRank,
+    Gene,
+    Module,
+    Degree,
+    InDegree,
+    WeightedDegree,
+    MeanAbsCor,
+    MaxAbsCor,
+    kME,
+    abs_kME,
+    any_of(c("Preferred_name", "Description", "KEGG_Pathway", "GOs"))
+  )
+
+write_tsv(
+  candidate_nonNLR_hubs,
+  file.path(outdir, "Candidate_nonNLR_coexpressed_hub_targets.tsv")
+)
+
+cat("\n===== Top coexpressed non-NLR hub targets =====\n")
+print(
+  candidate_nonNLR_hubs %>%
+    dplyr::slice_head(n = 20)
+)
+
+
+## -----------------------------
+## 16. Figure 1: module network size
+## -----------------------------
+
+p1 <- module_network_summary %>%
+  mutate(
+    Module = factor(Module, levels = rev(Module))
+  ) %>%
+  ggplot(
+    aes(x = Edges, y = Module)
+  ) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = Edges),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  scale_x_continuous(
+    limits = c(0, max(module_network_summary$Edges, na.rm = TRUE) * 1.15)
+  ) +
+  labs(
+    title = "NLR-centered co-expression network size by WGCNA module",
+    x = "Number of retained NLR-centered edges",
+    y = "WGCNA module"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p1)
+
+save_plot(
+  p1,
+  "Fig1_module_network_edge_counts",
+  width = 7.5,
+  height = 5.2
+)
+
+
+## -----------------------------
+## 17. Figure 2: top NLR hubs
+## -----------------------------
+
+top_n_hubs_plot <- 25
+
+p2 <- nlr_seed_hub_ranking %>%
+  dplyr::slice_head(n = top_n_hubs_plot) %>%
+  mutate(
+    Gene = factor(Gene, levels = rev(Gene)),
+    Type = factor(Type, levels = tcr_levels)
+  ) %>%
+  ggplot(
+    aes(x = Degree, y = Gene, fill = Type)
+  ) +
+  geom_col(width = 0.7, color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = type_cols, drop = FALSE) +
+  labs(
+    title = paste0("Top ", top_n_hubs_plot, " DE NLR hubs in NLR-centered networks"),
+    x = "Network degree",
+    y = "Seed NLR",
+    fill = "NLR type"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p2)
+
+save_plot(
+  p2,
+  "Fig2_top_NLR_seed_hubs_by_degree",
+  width = 7.5,
+  height = 7
+)
+
+
+## -----------------------------
+## 18. Figure 3: edge correlation distribution
+## -----------------------------
+
+p3 <- network_edges %>%
+  mutate(
+    Module = factor(Module, levels = module_network_summary$Module)
+  ) %>%
+  ggplot(
+    aes(x = Correlation, fill = Direction)
+  ) +
+  geom_histogram(
+    bins = 40,
+    color = "white",
+    linewidth = 0.2
+  ) +
+  facet_wrap(~ Module, scales = "free_y") +
+  scale_fill_manual(
+    values = c(
+      positive = "#B2182B",
+      negative = "#2166AC"
+    )
+  ) +
+  labs(
+    title = "Distribution of NLR-centered co-expression correlations",
+    x = "Correlation",
+    y = "Edge count",
+    fill = "Direction"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p3)
+
+save_plot(
+  p3,
+  "Fig3_edge_correlation_distribution_by_module",
+  width = 9,
+  height = 6
+)
+
+
+## -----------------------------
+## 19. Figure 4: node class composition
+## -----------------------------
+
+node_class_summary <- nodes %>%
+  filter(Module %in% unique(network_edges$Module)) %>%
+  dplyr::count(Module, NodeClass, name = "Node_count") %>%
+  group_by(Module) %>%
+  mutate(
+    Module_total_nodes = sum(Node_count),
+    Ratio = Node_count / Module_total_nodes
+  ) %>%
+  ungroup()
+
+p4 <- node_class_summary %>%
+  mutate(
+    Module = factor(Module, levels = module_network_summary$Module),
+    NodeClass = factor(
+      NodeClass,
+      levels = c("Seed_DE_NLR", "Other_TCR_NLR", "Coexpressed_gene")
+    ),
+    label = ifelse(Node_count > 0, as.character(Node_count), "")
+  ) %>%
+  ggplot(
+    aes(x = Module, y = Ratio, fill = NodeClass)
+  ) +
+  geom_col(width = 0.7, color = "black", linewidth = 0.2) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 3.3
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = node_class_cols, drop = FALSE) +
+  labs(
+    title = "Node composition of NLR-centered co-expression networks",
+    x = "WGCNA module",
+    y = "Proportion of network nodes",
+    fill = "Node class"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+print(p4)
+
+save_plot(
+  p4,
+  "Fig4_network_node_class_composition",
+  width = 8.5,
+  height = 5.2
+)
+
+
+## -----------------------------
+## 20. Figure 5: seed NLR × target heatmap for best module
+## -----------------------------
+
+best_module_for_heatmap <- module_network_summary %>%
+  arrange(Rank_DE_TCR_enrichment, desc(Edges)) %>%
+  dplyr::slice_head(n = 1) %>%
+  pull(Module)
+
+top_heatmap_targets <- 40
+
+heatmap_targets <- network_edges %>%
+  filter(Module == best_module_for_heatmap) %>%
+  group_by(Target) %>%
+  summarise(
+    Target_degree = n(),
+    Max_abs_cor = max(abs_cor, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Target_degree), desc(Max_abs_cor)) %>%
+  dplyr::slice_head(n = top_heatmap_targets) %>%
+  pull(Target)
+
+heatmap_df <- network_edges %>%
+  filter(
+    Module == best_module_for_heatmap,
+    Target %in% heatmap_targets
+  ) %>%
+  mutate(
+    Source = factor(Source, levels = unique(Source)),
+    Target = factor(Target, levels = rev(heatmap_targets))
+  )
+
+if (nrow(heatmap_df) > 0) {
+  
+  p5 <- ggplot(
+    heatmap_df,
+    aes(x = Source, y = Target, fill = Correlation)
+  ) +
+    geom_tile(color = "white", linewidth = 0.25) +
+    scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0
+    ) +
+    labs(
+      title = paste0("NLR-centered co-expression heatmap in module ", best_module_for_heatmap),
+      subtitle = paste0("Top ", top_heatmap_targets, " target genes by degree"),
+      x = "Seed DE TNL/CNL/RNL",
+      y = "Coexpressed target gene",
+      fill = "Correlation"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank()
+    )
+  
+  print(p5)
+  
+  save_plot(
+    p5,
+    paste0("Fig5_seed_NLR_target_heatmap_module_", safe_name(best_module_for_heatmap)),
+    width = 11,
+    height = 8
+  )
+}
+
+
+## -----------------------------
+## 21. Figure 6: kME vs network degree
+## -----------------------------
+
+p6 <- nodes %>%
+  filter(IsSeedNLR) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels)
+  ) %>%
+  ggplot(
+    aes(x = abs_kME, y = Degree, color = Type)
+  ) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_text(
+    aes(label = Gene),
+    hjust = -0.05,
+    vjust = 0.3,
+    size = 2.7,
+    check_overlap = TRUE
+  ) +
+  scale_color_manual(values = type_cols, drop = FALSE) +
+  labs(
+    title = "Relationship between module membership and NLR-centered network degree",
+    x = "Absolute kME",
+    y = "Network degree",
+    color = "NLR type"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p6)
+
+save_plot(
+  p6,
+  "Fig6_seed_NLR_kME_vs_network_degree",
+  width = 7.5,
+  height = 5.5
+)
+
+
+## -----------------------------
+## 22. Export concise summary
+## -----------------------------
+
+summary_file <- file.path(outdir, "NLR_centered_network_summary.txt")
+
+sink(summary_file)
+
+cat("NLR-centered co-expression network analysis\n")
+cat("===========================================\n\n")
+
+cat("1. Parameters\n")
+cat("min_abs_cor:", min_abs_cor, "\n")
+cat("max_pvalue:", max_pvalue, "\n")
+cat("top_n_targets_per_NLR:", top_n_targets_per_NLR, "\n")
+cat("soft_power_for_weight:", soft_power_for_weight, "\n\n")
+
+cat("2. Selected modules\n")
+print(
+  module_enrichment %>%
+    filter(Module %in% modules_to_network) %>%
+    dplyr::select(
+      Rank_DE_TCR_enrichment,
+      Module,
+      ModuleSize,
+      DE_TCR_NLR,
+      DE_TCR_density,
+      FoldEnrichment_DE_TCR,
+      FDR_DE_TCR,
+      Priority
+    ) %>%
+    arrange(match(Module, modules_to_network))
+)
+cat("\n")
+
+cat("3. Module network summary\n")
+print(module_network_summary)
+cat("\n")
+
+cat("4. Top NLR seed hubs\n")
+print(
+  nlr_seed_hub_ranking %>%
+    dplyr::select(
+      HubRank,
+      Gene,
+      Type,
+      Module,
+      Degree,
+      WeightedDegree,
+      abs_kME,
+      Cluster,
+      max_abs_log2FC,
+      main_response_time,
+      direction_at_max
+    ) %>%
+    dplyr::slice_head(n = 30)
+)
+cat("\n")
+
+cat("5. Top non-NLR coexpressed hub targets\n")
+print(
+  candidate_nonNLR_hubs %>%
+    dplyr::slice_head(n = 30)
+)
+cat("\n")
+
+cat("6. Interpretation note\n")
+cat(
+  "This network should be interpreted as an NLR-centered co-expression candidate network. ",
+  "Edges indicate strong temporal expression correlation within prioritized WGCNA modules, ",
+  "not direct physical interaction or causal regulation.\n",
+  sep = ""
+)
+
+sink()
+
+
+## -----------------------------
+## 23. Save RDS objects
+## -----------------------------
+
+saveRDS(
+  list(
+    network_edges = network_edges,
+    nodes = nodes,
+    nlr_seed_hub_ranking = nlr_seed_hub_ranking,
+    top_targets_by_NLR = top_targets_by_NLR,
+    module_network_summary = module_network_summary,
+    candidate_nonNLR_hubs = candidate_nonNLR_hubs,
+    modules_to_network = modules_to_network,
+    parameters = list(
+      min_abs_cor = min_abs_cor,
+      max_pvalue = max_pvalue,
+      top_n_targets_per_NLR = top_n_targets_per_NLR,
+      soft_power_for_weight = soft_power_for_weight
+    )
+  ),
+  file.path(outdir, "NLR_centered_coexpression_network_results.rds")
+)
+
+
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(module_network_summary, n = 30, title = "Module-level NLR-centered network summary")
+show_table(
+  nlr_seed_hub_ranking %>%
+    dplyr::select(
+      HubRank,
+      Gene,
+      Type,
+      Module,
+      Degree,
+      WeightedDegree,
+      abs_kME,
+      max_abs_log2FC,
+      main_response_time,
+      direction_at_max
+    ),
+  n = 30,
+  title = "Top NLR seed hubs"
+)
+show_table(candidate_nonNLR_hubs, n = 30, title = "Top non-NLR coexpressed hub targets")
+```

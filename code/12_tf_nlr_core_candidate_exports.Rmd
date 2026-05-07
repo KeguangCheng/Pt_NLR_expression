@@ -1,0 +1,287 @@
+---
+title: "TF NLR Core Candidate Exports"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+outdir <- analysis_file("04_TF_NLR_network")
+```
+
+```{r}
+high_conf_edges <- read_tsv(
+  analysis_file("04_TF_NLR_network", "Candidate_TF_NLR_edges.tsv"),
+  show_col_types = FALSE
+) %>%
+  filter(
+    EvidenceScore >= 3,
+    TF_NLR_abs_cor >= 0.80,
+    TF_DE_LRT == TRUE | SameModule == TRUE
+  )
+
+cat("High-confidence edges:", nrow(high_conf_edges), "\n")
+cat("TFs:", n_distinct(high_conf_edges$TF_gene), "\n")
+cat("NLRs:", n_distinct(high_conf_edges$NLR_gene), "\n")
+
+write_tsv(
+  high_conf_edges,
+  file.path(outdir, "High_confidence_TF_NLR_edges_relaxed.tsv")
+)
+
+
+nodes <- read_tsv(
+  analysis_file("04_TF_NLR_network", "Cytoscape_TF_NLR_nodes.tsv"),
+  show_col_types = FALSE
+)
+
+high_conf_nodes <- nodes %>%
+  filter(Gene %in% unique(c(high_conf_edges$TF_gene, high_conf_edges$NLR_gene)))
+
+write_tsv(
+  high_conf_nodes,
+  analysis_file("04_TF_NLR_network", "High_confidence_TF_NLR_nodes.tsv")
+)
+```
+```{r}
+nlr_hub <- read_tsv(
+  analysis_file("NLR_centered_coexpression_network", "NLR_seed_hub_ranking.tsv"),
+  show_col_types = FALSE
+)
+
+tf_target_rank <- read_tsv(
+  file.path(outdir, "Candidate_NLR_regulatory_target_ranking.tsv"),
+  show_col_types = FALSE
+)
+
+core_nlr_candidates <- nlr_hub %>%
+  select(
+    Gene,
+    Coexpr_HubRank = HubRank,
+    Type,
+    Module,
+    Coexpr_Degree = Degree,
+    Coexpr_WeightedDegree = WeightedDegree,
+    abs_kME,
+    max_abs_log2FC,
+    main_response_time,
+    direction_at_max
+  ) %>%
+  inner_join(
+    tf_target_rank %>%
+      select(
+        Gene,
+        TF_TargetRank = NLR_TargetRank,
+        TF_InDegree = InDegree,
+        TF_WeightedDegree = WeightedDegree
+      ),
+    by = "Gene"
+  ) %>%
+  arrange(Coexpr_HubRank, TF_TargetRank)
+
+write_tsv(
+  core_nlr_candidates,
+  file.path(outdir, "Core_NLR_candidates_coexpression_and_TF_network.tsv")
+)
+
+core_nlr_candidates
+```
+```{r}
+top_core_nlr <- core_nlr_candidates %>%
+  slice_head(n = 15) %>%
+  pull(Gene)
+
+final_tf_nlr_edges <- high_conf_edges %>%
+  filter(NLR_gene %in% top_core_nlr) %>%
+  transmute(
+    Source = TF_gene,
+    Target = NLR_gene,
+    EdgeType = "TF_to_NLR_candidate",
+    TF_family,
+    TF_name.x,
+    NLR_Type,
+    Motif,
+    Correlation = TF_NLR_cor,
+    abs_cor = TF_NLR_abs_cor,
+    Direction = CorDirection,
+    EvidenceScore,
+    EvidenceClass,
+    SameModule,
+    TF_DE_LRT,
+    TF_module,
+    NLR_module,
+    qvalue_Tomtom,
+    FIMO_best_pvalue,
+    Motif_enrichment_FDR
+  )
+
+write_tsv(
+  final_tf_nlr_edges,
+  file.path(outdir, "Final_core_TF_NLR_edges_for_Cytoscape.tsv")
+)
+
+final_nodes <- tibble(
+  Gene = unique(c(final_tf_nlr_edges$Source, final_tf_nlr_edges$Target))
+) %>%
+  mutate(
+    NodeType = case_when(
+      Gene %in% final_tf_nlr_edges$Source ~ "TF",
+      Gene %in% final_tf_nlr_edges$Target ~ "NLR",
+      TRUE ~ "Other"
+    )
+  )
+
+write_tsv(
+  final_nodes,
+  file.path(outdir, "Final_core_TF_NLR_nodes_for_Cytoscape.tsv")
+)
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(
+  tibble(
+    Metric = c(
+      "High_confidence_edges",
+      "High_confidence_TFs",
+      "High_confidence_NLRs",
+      "Core_NLR_candidates",
+      "Final_core_TF_NLR_edges"
+    ),
+    Value = c(
+      nrow(high_conf_edges),
+      dplyr::n_distinct(high_conf_edges$TF_gene),
+      dplyr::n_distinct(high_conf_edges$NLR_gene),
+      nrow(core_nlr_candidates),
+      nrow(final_tf_nlr_edges)
+    )
+  ),
+  n = 20,
+  title = "Core TF-NLR export summary"
+)
+show_table(high_conf_edges, n = 30, title = "High-confidence TF-NLR edges")
+show_table(core_nlr_candidates, n = 30, title = "Core NLR candidates from coexpression and TF network")
+show_table(final_tf_nlr_edges, n = 30, title = "Final core TF-NLR edges for Cytoscape")
+show_table(final_nodes, n = 30, title = "Final core TF-NLR nodes for Cytoscape")
+```

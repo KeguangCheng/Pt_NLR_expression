@@ -1,0 +1,1522 @@
+---
+title: "log2FC Threshold Sensitivity"
+author: "Keguang Cheng"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, results = "hide")
+
+input_file <- knitr::current_input(dir = TRUE)
+has_input_file <- !is.null(input_file) &&
+  length(input_file) > 0 &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+if (has_input_file) {
+  input_dir <- dirname(normalizePath(input_file, mustWork = FALSE))
+  project_dir <- if (basename(input_dir) == "code") {
+    normalizePath(file.path(input_dir, ".."), mustWork = TRUE)
+  } else {
+    normalizePath(input_dir, mustWork = TRUE)
+  }
+} else {
+  cwd <- normalizePath(getwd(), mustWork = TRUE)
+  project_dir <- if (basename(cwd) == "code") {
+    normalizePath(file.path(cwd, ".."), mustWork = TRUE)
+  } else {
+    cwd
+  }
+}
+
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+suppressPackageStartupMessages({
+  library(tximport)
+  library(DESeq2)
+  library(WGCNA)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(pheatmap)
+  library(Mfuzz)
+  library(Biobase)
+  library(scales)
+  library(igraph)
+  library(ggrepel)
+  library(jsonlite)
+})
+
+
+options(stringsAsFactors = FALSE)
+WGCNA::allowWGCNAThreads()
+
+rdata_dir <- file.path(project_dir, "RData")
+dir.create(rdata_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_file <- function(name) {
+  file.path(rdata_dir, paste0(name, ".rds"))
+}
+
+cache_or_run <- function(name, expr, refresh = FALSE) {
+  path <- rds_file(name)
+  if (file.exists(path) && !refresh) {
+    message("Loading cached object: ", path)
+    readRDS(path)
+  } else {
+    message("Running and saving object: ", path)
+    value <- force(expr)
+    saveRDS(value, path)
+    value
+  }
+}
+
+load_rds_object <- function(name, required = TRUE) {
+  path <- rds_file(name)
+  if (!file.exists(path)) {
+    if (required) stop("Missing cached object: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+load_rds_list <- function(name, required = TRUE, envir = .GlobalEnv) {
+  value <- load_rds_object(name, required = required)
+  if (!is.null(value)) list2env(value, envir = envir)
+  invisible(value)
+}
+
+analysis_file <- function(...) {
+  file.path(rdata_dir, ...)
+}
+
+input_file_path <- function(...) {
+  cached <- file.path(rdata_dir, ...)
+  if (file.exists(cached)) return(cached)
+  file.path(project_dir, ...)
+}
+
+show_table <- function(x, n = 20, title = NULL) {
+  if (!is.null(title)) {
+    cat("\n### ", title, "\n\n", sep = "")
+  }
+  if (is.null(x)) {
+    cat("No object available.\n")
+    return(invisible(NULL))
+  }
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) {
+    cat("No rows.\n")
+    return(invisible(df))
+  }
+  print(utils::head(df, n))
+  invisible(df)
+}
+
+show_plot_files <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    return(invisible(NULL))
+  }
+  paths <- normalizePath(paths, mustWork = TRUE)
+  knitr::include_graphics(paths)
+}
+```
+
+```{r load-upstream}
+load_rds_list("01_deseq_lrt")
+```
+
+```{r}
+
+############################################################
+## Step 3. log2FC threshold sensitivity analysis
+## Purpose:
+##   Use LRT padj < 0.05 as the primary criterion,
+##   and evaluate how many biologically relevant NLRs would be lost
+##   under strict |log2FC| >= 1 filtering.
+##
+## Main input:
+##   1. dds or dds_lrt
+##   2. res, DESeq2 LRT result, optional if master table already has padj
+##   3. NLR_master_TNL_CNL_RNL.tsv
+##
+## Main output:
+##   Directory: log2FC_threshold_sensitivity_TNL_CNL_RNL
+############################################################
+
+
+## -----------------------------
+## 0. Settings
+## -----------------------------
+
+outdir <- analysis_file("log2FC_threshold_sensitivity_TNL_CNL_RNL")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+tcr_levels <- c("TNL", "CNL", "RNL")
+
+alpha_lrt <- 0.05
+alpha_wald <- 0.05
+
+thresholds <- c(1, 0.75, 0.5, 0.25, 0)
+
+time_col <- "time"
+
+manual_control_level <- NULL
+# manual_control_level <- "CK"
+
+manual_target_levels <- NULL
+# manual_target_levels <- c("2d", "5d", "8d")
+
+
+## -----------------------------
+## 1. Helper functions
+## -----------------------------
+
+save_plot <- function(plot_obj, filename, width = 7, height = 5) {
+  ggsave(
+    filename = file.path(outdir, paste0(filename, ".pdf")),
+    plot = plot_obj,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    filename = file.path(outdir, paste0(filename, ".png")),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+as_logical_safe <- function(x) {
+  if (is.logical(x)) return(x)
+  
+  x_chr <- toupper(trimws(as.character(x)))
+  
+  dplyr::case_when(
+    x_chr %in% c("TRUE", "T", "1", "YES", "Y") ~ TRUE,
+    x_chr %in% c("FALSE", "F", "0", "NO", "N") ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+make_suffix <- function(x) {
+  y <- stringr::str_replace_all(x, "[^A-Za-z0-9]+", "_")
+  y <- stringr::str_replace_all(y, "^_+|_+$", "")
+  y[y == ""] <- "time"
+  make.unique(y, sep = "_")
+}
+
+extract_day <- function(x) {
+  day_num <- suppressWarnings(as.numeric(stringr::str_extract(x, "\\d+\\.?\\d*")))
+  day_num[is.na(day_num)] <- Inf
+  day_num
+}
+
+threshold_label_fun <- function(th) {
+  ifelse(
+    th == 0,
+    "LRT only",
+    paste0("|max log2FC| >= ", th)
+  )
+}
+
+type_cols <- c(
+  TNL = "#7B3294",
+  CNL = "#008837",
+  RNL = "#E66101"
+)
+
+strength_cols <- c(
+  "strong_|LFC|>=1" = "#B2182B",
+  "moderate_0.5<=|LFC|<1" = "#EF8A62",
+  "subtle_0.25<=|LFC|<0.5" = "#FDDDBC",
+  "LRT_only_|LFC|<0.25" = "#D1E5F0",
+  "LRT_DE_no_LFC" = "#BDBDBD"
+)
+
+
+## -----------------------------
+## 2. Check DESeq2 object
+## -----------------------------
+
+if (!exists("dds") && exists("dds_lrt")) {
+  dds <- dds_lrt
+  message("Object 'dds' was not found. Using 'dds_lrt' as dds.")
+}
+
+if (!exists("dds")) {
+  stop("Cannot find object 'dds' or 'dds_lrt'. Please load your DESeqDataSet first.")
+}
+
+
+## -----------------------------
+## 3. Detect time column and time levels
+## -----------------------------
+
+sample_info <- as.data.frame(colData(dds))
+
+if (!time_col %in% colnames(sample_info)) {
+  candidate_time_cols <- c(
+    "time", "Time",
+    "day", "Day",
+    "condition", "Condition",
+    "group", "Group",
+    "treatment", "Treatment"
+  )
+  
+  matched_time_col <- intersect(candidate_time_cols, colnames(sample_info))
+  
+  if (length(matched_time_col) == 0) {
+    stop(
+      "Cannot identify time column in colData(dds). Available columns are: ",
+      paste(colnames(sample_info), collapse = ", ")
+    )
+  }
+  
+  time_col <- matched_time_col[1]
+  message("Using detected time column: ", time_col)
+}
+
+time_vector <- sample_info[[time_col]]
+
+if (is.factor(time_vector)) {
+  time_levels <- levels(time_vector)
+} else {
+  time_levels <- unique(as.character(time_vector))
+}
+
+time_levels <- time_levels[!is.na(time_levels)]
+
+cat("\nDetected time column:", time_col, "\n")
+cat("Detected time levels:", paste(time_levels, collapse = ", "), "\n")
+
+
+## -----------------------------
+## 4. Detect control and treatment time points
+## -----------------------------
+
+if (is.null(manual_control_level)) {
+  control_candidates <- c(
+    "0d", "0D", "d0", "D0",
+    "0day", "0Day", "day0", "Day0",
+    "0dpi", "0DPI",
+    "CK", "ck",
+    "control", "Control", "CTRL", "ctrl",
+    "CON", "con",
+    "0"
+  )
+  
+  control_hits <- time_levels[tolower(time_levels) %in% tolower(control_candidates)]
+  
+  if (length(control_hits) == 0) {
+    stop(
+      "Cannot automatically identify control level. Please set manual_control_level. Available time levels are: ",
+      paste(time_levels, collapse = ", ")
+    )
+  }
+  
+  control_level <- control_hits[1]
+} else {
+  control_level <- manual_control_level
+}
+
+if (!control_level %in% time_levels) {
+  stop(
+    "control_level is not found in time levels. control_level = ",
+    control_level,
+    "; available levels = ",
+    paste(time_levels, collapse = ", ")
+  )
+}
+
+if (is.null(manual_target_levels)) {
+  target_levels <- setdiff(time_levels, control_level)
+  target_levels <- target_levels[order(extract_day(target_levels), target_levels)]
+} else {
+  target_levels <- manual_target_levels
+}
+
+if (!all(target_levels %in% time_levels)) {
+  stop(
+    "Some target levels are not found in time levels. target_levels = ",
+    paste(target_levels, collapse = ", "),
+    "; available levels = ",
+    paste(time_levels, collapse = ", ")
+  )
+}
+
+cat("Control level:", control_level, "\n")
+cat("Target levels:", paste(target_levels, collapse = ", "), "\n")
+
+time_suffixes <- make_suffix(target_levels)
+
+time_info <- tibble(
+  time_level = target_levels,
+  suffix = time_suffixes,
+  contrast = paste0(target_levels, "_vs_", control_level)
+)
+
+write_tsv(
+  time_info,
+  file.path(outdir, "Wald_contrast_time_info.tsv")
+)
+
+print(time_info)
+
+
+## -----------------------------
+## 5. Run DESeq2 Wald test
+## -----------------------------
+
+dds_wald <- dds
+
+new_time_levels <- c(control_level, target_levels, setdiff(time_levels, c(control_level, target_levels)))
+
+colData(dds_wald)[[time_col]] <- factor(
+  as.character(colData(dds_wald)[[time_col]]),
+  levels = new_time_levels
+)
+
+colData(dds_wald)[[time_col]] <- relevel(
+  colData(dds_wald)[[time_col]],
+  ref = control_level
+)
+
+cat("\nRunning DESeq2 Wald test...\n")
+dds_wald <- cache_or_run("10_deseq_wald", {
+  DESeq(dds_wald, test = "Wald")
+})
+
+cat("\nAvailable results names:\n")
+print(resultsNames(dds_wald))
+
+
+## -----------------------------
+## 6. Extract Wald pairwise results
+## -----------------------------
+
+extract_wald_result <- function(tp, suf) {
+  
+  cat("Extracting Wald contrast:", tp, "vs", control_level, "\n")
+  
+  res_tp <- results(
+    dds_wald,
+    contrast = c(time_col, tp, control_level),
+    alpha = alpha_wald
+  )
+  
+  as.data.frame(res_tp) %>%
+    rownames_to_column("Gene") %>%
+    mutate(Gene = as.character(Gene) %>% str_trim()) %>%
+    transmute(
+      Gene,
+      !!paste0("baseMean_Wald_", suf) := as.numeric(baseMean),
+      !!paste0("log2FC_", suf) := as.numeric(log2FoldChange),
+      !!paste0("lfcSE_", suf) := as.numeric(lfcSE),
+      !!paste0("stat_Wald_", suf) := as.numeric(stat),
+      !!paste0("pvalue_Wald_", suf) := as.numeric(pvalue),
+      !!paste0("padj_Wald_", suf) := as.numeric(padj)
+    )
+}
+
+wald_result_list <- map2(
+  target_levels,
+  time_suffixes,
+  extract_wald_result
+)
+
+wald_all <- purrr::reduce(
+  wald_result_list,
+  dplyr::full_join,
+  by = "Gene"
+)
+
+write_tsv(
+  wald_all,
+  file.path(outdir, "All_genes_Wald_pairwise_results.tsv")
+)
+
+
+## -----------------------------
+## 7. Read TNL/CNL/RNL master table
+## -----------------------------
+
+if (file.exists(analysis_file("NLR_master_TNL_CNL_RNL.tsv"))) {
+  nlr_master <- read_tsv(
+    analysis_file("NLR_master_TNL_CNL_RNL.tsv"),
+    show_col_types = FALSE
+  )
+} else if (exists("nlr_master")) {
+  nlr_master <- as_tibble(nlr_master)
+  message("Using object 'nlr_master' from current R environment.")
+} else {
+  stop("Cannot find NLR_master_TNL_CNL_RNL.tsv or object 'nlr_master'.")
+}
+
+if (!"Gene" %in% colnames(nlr_master)) {
+  colnames(nlr_master)[1] <- "Gene"
+}
+
+nlr_master <- nlr_master %>%
+  mutate(
+    Gene = as.character(Gene) %>% str_trim(),
+    Type = as.character(Type) %>% str_trim() %>% str_to_upper()
+  ) %>%
+  filter(Type %in% tcr_levels)
+
+if (!"padj" %in% colnames(nlr_master)) {
+  
+  if (!exists("res")) {
+    stop("NLR master table does not contain LRT padj, and object 'res' was not found.")
+  }
+  
+  res_lrt <- as.data.frame(res) %>%
+    rownames_to_column("Gene") %>%
+    mutate(Gene = as.character(Gene) %>% str_trim()) %>%
+    dplyr::select(Gene, baseMean, stat, pvalue, padj)
+  
+  nlr_master <- nlr_master %>%
+    left_join(res_lrt, by = "Gene")
+}
+
+nlr_master <- nlr_master %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    Has_padj = !is.na(padj),
+    DE_LRT = case_when(
+      Has_padj & padj < alpha_lrt ~ TRUE,
+      Has_padj & padj >= alpha_lrt ~ FALSE,
+      TRUE ~ NA
+    )
+  )
+
+cat("\n===== NLR master check =====\n")
+print(
+  nlr_master %>%
+    group_by(Type) %>%
+    summarise(
+      Total_NLR = n(),
+      Tested_NLR = sum(Has_padj),
+      LRT_DE_NLR = sum(DE_LRT == TRUE, na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+
+## -----------------------------
+## 8. Merge Wald log2FC into NLR master
+## -----------------------------
+
+nlr_lfc <- nlr_master %>%
+  left_join(wald_all, by = "Gene")
+
+lfc_cols <- paste0("log2FC_", time_suffixes)
+padj_wald_cols <- paste0("padj_Wald_", time_suffixes)
+
+missing_lfc_cols <- setdiff(lfc_cols, colnames(nlr_lfc))
+missing_padj_cols <- setdiff(padj_wald_cols, colnames(nlr_lfc))
+
+if (length(missing_lfc_cols) > 0) {
+  stop("Missing log2FC columns: ", paste(missing_lfc_cols, collapse = ", "))
+}
+
+if (length(missing_padj_cols) > 0) {
+  stop("Missing Wald padj columns: ", paste(missing_padj_cols, collapse = ", "))
+}
+
+
+## -----------------------------
+## 9. Calculate max_abs_log2FC across time points
+## -----------------------------
+
+lfc_mat <- nlr_lfc %>%
+  dplyr::select(all_of(lfc_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+padj_wald_mat <- nlr_lfc %>%
+  dplyr::select(all_of(padj_wald_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+max_abs_log2FC <- apply(
+  lfc_mat,
+  1,
+  function(x) {
+    if (all(is.na(x))) {
+      NA_real_
+    } else {
+      max(abs(x), na.rm = TRUE)
+    }
+  }
+)
+
+abs_lfc_for_idx <- abs(lfc_mat)
+abs_lfc_for_idx[is.na(abs_lfc_for_idx)] <- -Inf
+
+valid_lfc <- rowSums(!is.na(lfc_mat)) > 0
+max_idx <- max.col(abs_lfc_for_idx, ties.method = "first")
+
+log2FC_at_max <- rep(NA_real_, nrow(lfc_mat))
+main_response_time <- rep(NA_character_, nrow(lfc_mat))
+
+log2FC_at_max[valid_lfc] <- lfc_mat[cbind(which(valid_lfc), max_idx[valid_lfc])]
+main_response_time[valid_lfc] <- target_levels[max_idx[valid_lfc]]
+
+any_Wald_padj05 <- rowSums(padj_wald_mat < alpha_wald, na.rm = TRUE) > 0
+
+Wald_sig_timepoints <- apply(
+  padj_wald_mat,
+  1,
+  function(x) {
+    sig <- !is.na(x) & x < alpha_wald
+    if (any(sig)) {
+      paste(target_levels[sig], collapse = ";")
+    } else {
+      NA_character_
+    }
+  }
+)
+
+nlr_lfc <- nlr_lfc %>%
+  mutate(
+    max_abs_log2FC = max_abs_log2FC,
+    log2FC_at_max = log2FC_at_max,
+    main_response_time = main_response_time,
+    direction_at_max = case_when(
+      log2FC_at_max > 0 ~ "up_at_max",
+      log2FC_at_max < 0 ~ "down_at_max",
+      log2FC_at_max == 0 ~ "zero_at_max",
+      TRUE ~ NA_character_
+    ),
+    any_Wald_padj05 = any_Wald_padj05,
+    Wald_sig_timepoints = Wald_sig_timepoints,
+    response_strength = case_when(
+      is.na(DE_LRT) | DE_LRT == FALSE ~ "not_LRT_DE",
+      DE_LRT == TRUE & is.na(max_abs_log2FC) ~ "LRT_DE_no_LFC",
+      DE_LRT == TRUE & max_abs_log2FC >= 1 ~ "strong_|LFC|>=1",
+      DE_LRT == TRUE & max_abs_log2FC >= 0.5 ~ "moderate_0.5<=|LFC|<1",
+      DE_LRT == TRUE & max_abs_log2FC >= 0.25 ~ "subtle_0.25<=|LFC|<0.5",
+      DE_LRT == TRUE ~ "LRT_only_|LFC|<0.25",
+      TRUE ~ "not_LRT_DE"
+    )
+  )
+
+response_strength_levels <- c(
+  "strong_|LFC|>=1",
+  "moderate_0.5<=|LFC|<1",
+  "subtle_0.25<=|LFC|<0.5",
+  "LRT_only_|LFC|<0.25",
+  "LRT_DE_no_LFC",
+  "not_LRT_DE"
+)
+
+nlr_lfc <- nlr_lfc %>%
+  mutate(
+    response_strength = factor(
+      response_strength,
+      levels = response_strength_levels
+    )
+  )
+
+write_tsv(
+  nlr_lfc,
+  file.path(outdir, "NLR_TCR_LRT_Wald_log2FC_sensitivity.tsv")
+)
+
+
+## -----------------------------
+## 10. Threshold sensitivity by Type
+## -----------------------------
+
+threshold_by_type <- map_dfr(
+  thresholds,
+  function(th) {
+    
+    df <- nlr_lfc %>%
+      filter(Has_padj)
+    
+    if (th == 0) {
+      df <- df %>%
+        mutate(pass_threshold = DE_LRT == TRUE)
+    } else {
+      df <- df %>%
+        mutate(
+          pass_threshold = DE_LRT == TRUE &
+            !is.na(max_abs_log2FC) &
+            max_abs_log2FC >= th
+        )
+    }
+    
+    df %>%
+      group_by(Type) %>%
+      summarise(
+        Tested_NLR = n(),
+        LRT_DE_NLR = sum(DE_LRT == TRUE, na.rm = TRUE),
+        Retained_NLR = sum(pass_threshold, na.rm = TRUE),
+        Lost_NLR = LRT_DE_NLR - Retained_NLR,
+        Retained_ratio_of_LRT_DE = ifelse(
+          LRT_DE_NLR > 0,
+          Retained_NLR / LRT_DE_NLR,
+          NA_real_
+        ),
+        Lost_ratio_of_LRT_DE = ifelse(
+          LRT_DE_NLR > 0,
+          Lost_NLR / LRT_DE_NLR,
+          NA_real_
+        ),
+        Retained_ratio_of_tested = Retained_NLR / Tested_NLR,
+        .groups = "drop"
+      ) %>%
+      mutate(
+        threshold = th,
+        threshold_label = threshold_label_fun(th)
+      ) %>%
+      dplyr::select(
+        threshold,
+        threshold_label,
+        Type,
+        Tested_NLR,
+        LRT_DE_NLR,
+        Retained_NLR,
+        Lost_NLR,
+        Retained_ratio_of_LRT_DE,
+        Lost_ratio_of_LRT_DE,
+        Retained_ratio_of_tested
+      )
+  }
+)
+
+threshold_by_type <- threshold_by_type %>%
+  mutate(
+    threshold_label = factor(
+      threshold_label,
+      levels = threshold_label_fun(thresholds)
+    ),
+    Type = factor(Type, levels = tcr_levels)
+  ) %>%
+  arrange(threshold, Type)
+
+write_tsv(
+  threshold_by_type,
+  file.path(outdir, "NLR_TCR_threshold_sensitivity_by_type.tsv")
+)
+
+cat("\n===== Threshold sensitivity by type =====\n")
+print(threshold_by_type)
+
+
+## -----------------------------
+## 11. Threshold sensitivity overall
+## -----------------------------
+
+threshold_overall <- threshold_by_type %>%
+  group_by(threshold, threshold_label) %>%
+  summarise(
+    Tested_NLR = sum(Tested_NLR),
+    LRT_DE_NLR = sum(LRT_DE_NLR),
+    Retained_NLR = sum(Retained_NLR),
+    Lost_NLR = sum(Lost_NLR),
+    Retained_ratio_of_LRT_DE = ifelse(
+      LRT_DE_NLR > 0,
+      Retained_NLR / LRT_DE_NLR,
+      NA_real_
+    ),
+    Lost_ratio_of_LRT_DE = ifelse(
+      LRT_DE_NLR > 0,
+      Lost_NLR / LRT_DE_NLR,
+      NA_real_
+    ),
+    Retained_ratio_of_tested = Retained_NLR / Tested_NLR,
+    .groups = "drop"
+  ) %>%
+  arrange(threshold)
+
+write_tsv(
+  threshold_overall,
+  file.path(outdir, "NLR_TCR_threshold_sensitivity_overall.tsv")
+)
+
+cat("\n===== Threshold sensitivity overall =====\n")
+print(threshold_overall)
+
+
+## -----------------------------
+## 12. Strict |log2FC| >= 1 loss summary
+## -----------------------------
+
+strict_loss_summary <- threshold_by_type %>%
+  filter(threshold == 1) %>%
+  mutate(
+    Interpretation = paste0(
+      "Using strict |max log2FC| >= 1 would retain ",
+      Retained_NLR,
+      " of ",
+      LRT_DE_NLR,
+      " LRT-DE ",
+      as.character(Type),
+      " genes and lose ",
+      Lost_NLR,
+      " genes."
+    )
+  )
+
+write_tsv(
+  strict_loss_summary,
+  file.path(outdir, "NLR_TCR_strict_log2FC1_loss_summary.tsv")
+)
+
+cat("\n===== Strict |log2FC| >= 1 loss summary =====\n")
+print(strict_loss_summary)
+
+
+## -----------------------------
+## 13. Response strength summary
+## -----------------------------
+
+response_strength_summary <- nlr_lfc %>%
+  filter(DE_LRT == TRUE) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    response_strength = factor(
+      as.character(response_strength),
+      levels = response_strength_levels[response_strength_levels != "not_LRT_DE"]
+    )
+  ) %>%
+  dplyr::count(Type, response_strength, name = "NLR_count") %>%
+  tidyr::complete(
+    Type = factor(tcr_levels, levels = tcr_levels),
+    response_strength = factor(
+      response_strength_levels[response_strength_levels != "not_LRT_DE"],
+      levels = response_strength_levels[response_strength_levels != "not_LRT_DE"]
+    ),
+    fill = list(NLR_count = 0)
+  ) %>%
+  group_by(Type) %>%
+  mutate(
+    Type_total_DE = sum(NLR_count),
+    Within_type_ratio = ifelse(
+      Type_total_DE > 0,
+      NLR_count / Type_total_DE,
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+write_tsv(
+  response_strength_summary,
+  file.path(outdir, "NLR_TCR_response_strength_summary.tsv")
+)
+
+cat("\n===== Response strength summary =====\n")
+print(response_strength_summary)
+
+
+## -----------------------------
+## 14. Main response time and direction
+## -----------------------------
+
+main_time_direction_summary <- nlr_lfc %>%
+  filter(DE_LRT == TRUE, !is.na(main_response_time), !is.na(direction_at_max)) %>%
+  mutate(
+    Type = factor(Type, levels = tcr_levels),
+    main_response_time = factor(main_response_time, levels = target_levels),
+    direction_at_max = factor(
+      direction_at_max,
+      levels = c("up_at_max", "down_at_max", "zero_at_max")
+    ),
+    response_time_direction = paste(main_response_time, direction_at_max, sep = "_")
+  ) %>%
+  dplyr::count(
+    Type,
+    main_response_time,
+    direction_at_max,
+    response_time_direction,
+    name = "NLR_count"
+  ) %>%
+  group_by(Type) %>%
+  mutate(
+    Type_total_DE = sum(NLR_count),
+    Within_type_ratio = NLR_count / Type_total_DE
+  ) %>%
+  ungroup()
+
+write_tsv(
+  main_time_direction_summary,
+  file.path(outdir, "NLR_TCR_main_response_time_direction_summary.tsv")
+)
+
+cat("\n===== Main response time and direction =====\n")
+print(main_time_direction_summary)
+
+
+## -----------------------------
+## 15. Per-timepoint threshold sensitivity
+## -----------------------------
+
+per_time_threshold_by_type <- map2_dfr(
+  target_levels,
+  time_suffixes,
+  function(tp, suf) {
+    
+    lfc_col <- paste0("log2FC_", suf)
+    padj_col <- paste0("padj_Wald_", suf)
+    
+    map_dfr(
+      thresholds,
+      function(th) {
+        
+        nlr_lfc %>%
+          filter(Has_padj) %>%
+          mutate(
+            abs_fc_pass = ifelse(
+              th == 0,
+              TRUE,
+              !is.na(.data[[lfc_col]]) & abs(.data[[lfc_col]]) >= th
+            ),
+            LRT_DE_pass_threshold = DE_LRT == TRUE & abs_fc_pass,
+            Wald_DE_pass_threshold = !is.na(.data[[padj_col]]) &
+              .data[[padj_col]] < alpha_wald &
+              abs_fc_pass,
+            Up_LRT_DE_pass_threshold = DE_LRT == TRUE &
+              !is.na(.data[[lfc_col]]) &
+              .data[[lfc_col]] > 0 &
+              abs_fc_pass,
+            Down_LRT_DE_pass_threshold = DE_LRT == TRUE &
+              !is.na(.data[[lfc_col]]) &
+              .data[[lfc_col]] < 0 &
+              abs_fc_pass
+          ) %>%
+          group_by(Type) %>%
+          summarise(
+            Tested_NLR = n(),
+            LRT_DE_NLR = sum(DE_LRT == TRUE, na.rm = TRUE),
+            LRT_DE_pass_threshold = sum(LRT_DE_pass_threshold, na.rm = TRUE),
+            Wald_DE_pass_threshold = sum(Wald_DE_pass_threshold, na.rm = TRUE),
+            Up_LRT_DE_pass_threshold = sum(Up_LRT_DE_pass_threshold, na.rm = TRUE),
+            Down_LRT_DE_pass_threshold = sum(Down_LRT_DE_pass_threshold, na.rm = TRUE),
+            .groups = "drop"
+          ) %>%
+          mutate(
+            time_point = tp,
+            threshold = th,
+            threshold_label = threshold_label_fun(th)
+          ) %>%
+          dplyr::select(
+            time_point,
+            threshold,
+            threshold_label,
+            Type,
+            Tested_NLR,
+            LRT_DE_NLR,
+            LRT_DE_pass_threshold,
+            Wald_DE_pass_threshold,
+            Up_LRT_DE_pass_threshold,
+            Down_LRT_DE_pass_threshold
+          )
+      }
+    )
+  }
+)
+
+per_time_threshold_by_type <- per_time_threshold_by_type %>%
+  mutate(
+    time_point = factor(time_point, levels = target_levels),
+    threshold_label = factor(threshold_label, levels = threshold_label_fun(thresholds)),
+    Type = factor(Type, levels = tcr_levels)
+  )
+
+write_tsv(
+  per_time_threshold_by_type,
+  file.path(outdir, "NLR_TCR_per_timepoint_threshold_sensitivity_by_type.tsv")
+)
+
+
+## -----------------------------
+## 16. Fisher test:
+##     Does structural type affect passing each FC threshold
+##     among LRT-DE NLRs?
+## -----------------------------
+
+threshold_fisher <- map_dfr(
+  thresholds[thresholds > 0],
+  function(th) {
+    
+    threshold_df <- nlr_lfc %>%
+      filter(Has_padj, DE_LRT == TRUE) %>%
+      mutate(
+        Type = factor(Type, levels = tcr_levels),
+        Pass_threshold = !is.na(max_abs_log2FC) & max_abs_log2FC >= th
+      ) %>%
+      dplyr::count(Type, Pass_threshold, name = "n") %>%
+      tidyr::complete(
+        Type = factor(tcr_levels, levels = tcr_levels),
+        Pass_threshold = c(FALSE, TRUE),
+        fill = list(n = 0)
+      )
+    
+    threshold_mat <- threshold_df %>%
+      pivot_wider(
+        names_from = Pass_threshold,
+        values_from = n,
+        values_fill = 0
+      ) %>%
+      arrange(Type)
+    
+    mat <- threshold_mat %>%
+      dplyr::select(`FALSE`, `TRUE`) %>%
+      as.matrix()
+    
+    rownames(mat) <- as.character(threshold_mat$Type)
+    
+    ft <- fisher.test(mat)
+    
+    tibble(
+      threshold = th,
+      threshold_label = threshold_label_fun(th),
+      pvalue = ft$p.value
+    )
+  }
+) %>%
+  mutate(
+    padj_BH = p.adjust(pvalue, method = "BH")
+  )
+
+write_tsv(
+  threshold_fisher,
+  file.path(outdir, "Fisher_test_Type_vs_passing_log2FC_threshold_among_LRT_DE.tsv")
+)
+
+capture.output(
+  threshold_fisher,
+  file = file.path(outdir, "Fisher_test_Type_vs_passing_log2FC_threshold_among_LRT_DE.txt")
+)
+
+cat("\n===== Fisher test: Type vs passing FC threshold among LRT-DE NLRs =====\n")
+print(threshold_fisher)
+
+
+## -----------------------------
+## 17. Figure 1:
+##     Retained NLR count under different thresholds
+## -----------------------------
+
+p1 <- threshold_by_type %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = factor(as.character(Type), levels = tcr_levels),
+    threshold_label = factor(
+      as.character(threshold_label),
+      levels = threshold_label_fun(thresholds)
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = threshold_label,
+      y = Retained_NLR,
+      group = Type,
+      color = Type
+    )
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = Retained_NLR),
+    vjust = -0.7,
+    size = 3.5,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = type_cols, drop = FALSE) +
+  labs(
+    title = "Number of LRT-DE NLRs retained under different log2FC thresholds",
+    x = "Filtering criterion",
+    y = "Retained LRT-DE NLR count",
+    color = "NLR type"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+
+print(p1)
+
+save_plot(
+  p1,
+  "Fig1_retained_NLR_count_under_log2FC_thresholds",
+  width = 8,
+  height = 5
+)
+
+
+## -----------------------------
+## 18. Figure 2:
+##     Retained ratio under different thresholds
+## -----------------------------
+
+p2 <- threshold_by_type %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = factor(as.character(Type), levels = tcr_levels),
+    threshold_label = factor(
+      as.character(threshold_label),
+      levels = threshold_label_fun(thresholds)
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = threshold_label,
+      y = Retained_ratio_of_LRT_DE,
+      group = Type,
+      color = Type
+    )
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = percent(Retained_ratio_of_LRT_DE, accuracy = 1)),
+    vjust = -0.7,
+    size = 3.5,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = type_cols, drop = FALSE) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, 1.08)
+  ) +
+  labs(
+    title = "Proportion of LRT-DE NLRs retained under different log2FC thresholds",
+    x = "Filtering criterion",
+    y = "Retained ratio among LRT-DE NLRs",
+    color = "NLR type"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+
+print(p2)
+
+save_plot(
+  p2,
+  "Fig2_retained_NLR_ratio_under_log2FC_thresholds",
+  width = 8,
+  height = 5
+)
+
+
+## -----------------------------
+## 19. Figure 3:
+##     Distribution of max_abs_log2FC
+## -----------------------------
+
+lfc_distribution_df <- nlr_lfc %>%
+  filter(DE_LRT == TRUE, !is.na(max_abs_log2FC)) %>%
+  mutate(Type = factor(Type, levels = tcr_levels))
+
+p3 <- ggplot(
+  lfc_distribution_df,
+  aes(x = Type, y = max_abs_log2FC, fill = Type)
+) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.55,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  geom_jitter(
+    width = 0.08,
+    alpha = 0.5,
+    size = 1
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dotted",
+    linewidth = 0.5
+  ) +
+  geom_hline(
+    yintercept = 0.25,
+    linetype = "dotted",
+    linewidth = 0.5
+  ) +
+  scale_fill_manual(values = type_cols, drop = FALSE) +
+  labs(
+    title = "Distribution of maximum absolute log2FC among LRT-DE NLRs",
+    subtitle = "Dashed line: |log2FC| = 1; dotted lines: 0.5 and 0.25",
+    x = "NLR structural class",
+    y = "max |log2FC| across time points"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+print(p3)
+
+save_plot(
+  p3,
+  "Fig3_max_abs_log2FC_distribution_LRT_DE_NLRs",
+  width = 6.5,
+  height = 5
+)
+
+
+## -----------------------------
+## 20. Figure 4:
+##     Response strength composition
+## -----------------------------
+
+p4 <- response_strength_summary %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = factor(as.character(Type), levels = tcr_levels),
+    response_strength = factor(
+      as.character(response_strength),
+      levels = response_strength_levels[response_strength_levels != "not_LRT_DE"]
+    ),
+    label = ifelse(NLR_count > 0, as.character(NLR_count), "")
+  ) %>%
+  ggplot(
+    aes(
+      x = Type,
+      y = Within_type_ratio,
+      fill = response_strength
+    )
+  ) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.25) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 3.5
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = strength_cols, drop = FALSE) +
+  labs(
+    title = "Response-strength composition of LRT-DE NLRs",
+    x = "NLR structural class",
+    y = "Proportion within LRT-DE NLRs",
+    fill = "Response strength"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(p4)
+
+save_plot(
+  p4,
+  "Fig4_response_strength_composition_LRT_DE_NLRs",
+  width = 8,
+  height = 5
+)
+
+
+## -----------------------------
+## 21. Figure 5:
+##     Strict |log2FC| >= 1 retained vs lost
+## -----------------------------
+
+strict_loss_plot_df <- strict_loss_summary %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  transmute(
+    Type = factor(as.character(Type), levels = tcr_levels),
+    Retained = Retained_NLR,
+    Lost = Lost_NLR
+  ) %>%
+  pivot_longer(
+    cols = c("Retained", "Lost"),
+    names_to = "Status",
+    values_to = "NLR_count"
+  ) %>%
+  mutate(
+    Status = factor(Status, levels = c("Retained", "Lost"))
+  ) %>%
+  group_by(Type) %>%
+  mutate(
+    Type_total = sum(NLR_count),
+    Ratio = ifelse(Type_total > 0, NLR_count / Type_total, NA_real_),
+    label = ifelse(NLR_count > 0, as.character(NLR_count), "")
+  ) %>%
+  ungroup()
+
+p5 <- ggplot(
+  strict_loss_plot_df,
+  aes(x = Type, y = Ratio, fill = Status)
+) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.25) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(
+    values = c(
+      Retained = "#B2182B",
+      Lost = "#D9D9D9"
+    )
+  ) +
+  labs(
+    title = "Effect of strict |max log2FC| >= 1 filtering",
+    subtitle = "Lost genes are LRT-DE NLRs that would be discarded by strict FC filtering",
+    x = "NLR structural class",
+    y = "Proportion among LRT-DE NLRs",
+    fill = "|log2FC| >= 1"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p5)
+
+save_plot(
+  p5,
+  "Fig5_strict_log2FC1_retained_vs_lost",
+  width = 6.5,
+  height = 5
+)
+
+
+## -----------------------------
+## 22. Figure 6:
+##     Main response time and direction
+## -----------------------------
+
+time_direction_cols <- c(
+  "up_at_max" = "#D73027",
+  "down_at_max" = "#4575B4",
+  "zero_at_max" = "#BDBDBD"
+)
+
+p6 <- main_time_direction_summary %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate(
+    Type = factor(as.character(Type), levels = tcr_levels),
+    main_response_time = factor(as.character(main_response_time), levels = target_levels),
+    direction_at_max = factor(
+      as.character(direction_at_max),
+      levels = c("up_at_max", "down_at_max", "zero_at_max")
+    ),
+    label = ifelse(NLR_count > 0, as.character(NLR_count), "")
+  ) %>%
+  ggplot(
+    aes(
+      x = main_response_time,
+      y = NLR_count,
+      fill = direction_at_max
+    )
+  ) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.25) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 3.5
+  ) +
+  facet_wrap(~ Type, nrow = 1) +
+  scale_fill_manual(values = time_direction_cols, drop = FALSE) +
+  labs(
+    title = "Main response time and direction of LRT-DE NLRs",
+    x = paste0("Time point relative to ", control_level),
+    y = "LRT-DE NLR count",
+    fill = "Direction at max |log2FC|"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+print(p6)
+
+save_plot(
+  p6,
+  "Fig6_main_response_time_and_direction",
+  width = 8,
+  height = 5
+)
+
+
+## -----------------------------
+## 23. Figure 7:
+##     Timepoint-specific threshold heatmap
+## -----------------------------
+
+p7 <- per_time_threshold_by_type %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  filter(threshold %in% c(1, 0.5, 0.25, 0)) %>%
+  mutate(
+    Type = factor(as.character(Type), levels = tcr_levels),
+    time_point = factor(as.character(time_point), levels = target_levels),
+    threshold_label = factor(
+      as.character(threshold_label),
+      levels = threshold_label_fun(c(1, 0.5, 0.25, 0))
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = time_point,
+      y = threshold_label,
+      fill = LRT_DE_pass_threshold
+    )
+  ) +
+  geom_tile(color = "white", linewidth = 0.35) +
+  geom_text(
+    aes(label = LRT_DE_pass_threshold),
+    size = 3.5
+  ) +
+  facet_wrap(~ Type, nrow = 1) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#B2182B"
+  ) +
+  labs(
+    title = "Timepoint-specific LRT-DE NLR counts passing log2FC thresholds",
+    x = paste0("Time point relative to ", control_level),
+    y = "Filtering criterion",
+    fill = "NLR count"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+print(p7)
+
+save_plot(
+  p7,
+  "Fig7_timepoint_specific_threshold_heatmap",
+  width = 9,
+  height = 5
+)
+
+
+## -----------------------------
+## 24. Text summary
+## -----------------------------
+
+overall_strict <- threshold_overall %>%
+  filter(threshold == 1) %>%
+  as.data.frame()
+
+overall_lrt_only <- threshold_overall %>%
+  filter(threshold == 0) %>%
+  as.data.frame()
+
+summary_file <- file.path(outdir, "log2FC_threshold_sensitivity_summary.txt")
+
+sink(summary_file)
+
+cat("log2FC threshold sensitivity analysis for TNL/CNL/RNL NLRs\n")
+
+cat("1. Time contrasts used for Wald test\n")
+print(time_info)
+cat("\n")
+
+cat("2. Overall threshold sensitivity\n")
+print(threshold_overall)
+cat("\n")
+
+cat("3. Threshold sensitivity by structural type\n")
+print(threshold_by_type)
+cat("\n")
+
+cat("4. Strict |max log2FC| >= 1 loss summary\n")
+print(strict_loss_summary)
+cat("\n")
+
+cat("5. Response strength summary\n")
+print(response_strength_summary)
+cat("\n")
+
+cat("6. Main response time and direction summary\n")
+print(main_time_direction_summary)
+cat("\n")
+
+cat("7. Fisher test: structural type vs passing each FC threshold among LRT-DE NLRs\n")
+print(threshold_fisher)
+cat("\n")
+
+cat("8. Key overall interpretation\n")
+cat(
+  "Under LRT-only criterion, the number of time-responsive TNL/CNL/RNL NLRs is ",
+  overall_lrt_only$Retained_NLR,
+  ".\n",
+  sep = ""
+)
+
+cat(
+  "Under strict |max log2FC| >= 1 filtering, only ",
+  overall_strict$Retained_NLR,
+  " of ",
+  overall_strict$LRT_DE_NLR,
+  " LRT-DE NLRs would be retained, while ",
+  overall_strict$Lost_NLR,
+  " would be discarded. Lost ratio = ",
+  round(overall_strict$Lost_ratio_of_LRT_DE, 4),
+  ".\n",
+  sep = ""
+)
+
+cat("\nRecommended reporting strategy:\n")
+cat(
+  "Use LRT adjusted p-value < 0.05 as the primary definition of time-responsive NLRs, ",
+  "and report |max log2FC| >= 1, 0.75, 0.5, and 0.25 as threshold sensitivity analyses.\n",
+  sep = ""
+)
+
+sink()
+
+
+```
+
+```{r save-log2fc-state}
+saveRDS(
+  list(
+    nlr_lfc = nlr_lfc,
+    time_info = time_info,
+    target_levels = target_levels,
+    time_suffixes = time_suffixes,
+    threshold_by_type = threshold_by_type,
+    threshold_overall = threshold_overall,
+    response_strength_summary = response_strength_summary,
+    main_time_direction_summary = main_time_direction_summary
+  ),
+  rds_file("11_log2fc_threshold_sensitivity")
+)
+```
+
+```{r display-key-results, results='markup', echo=FALSE}
+show_table(threshold_overall, n = 20, title = "Overall log2FC threshold sensitivity")
+show_table(threshold_by_type, n = 30, title = "Threshold sensitivity by structural class")
+show_table(strict_loss_summary, n = 20, title = "Strict |max log2FC| >= 1 loss summary")
+show_table(response_strength_summary, n = 30, title = "Response strength composition")
+```
